@@ -280,6 +280,7 @@ func NewWithOpts(t *testing.T, opts Options) *Context {
 func (c *Context) Cleanup() {
 	if c.EP != nil {
 		c.EP.Close()
+		defer c.EP.Release()
 	}
 	c.Stack().Close()
 	c.Stack().Wait()

@@ -855,7 +855,7 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 		t.Errorf("got stats.TCP.CurrentEstablished.Value() = %d, want = 0", got)
 	}
 
-	// Check if the endpoint was moved to CLOSED and netstack a reset in
+	// Check if the endpoint was moved to CLOSED and netstack sent a reset in
 	// response to the ACK packet that we sent after last-ACK.
 	checker.IPv4(t, c.GetPacket(),
 		checker.TCP(
@@ -8631,6 +8631,7 @@ func TestECNFlagsAccept(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
+	tcpip.ReleaseDanglingEndpoints()
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)

@@ -151,6 +151,11 @@ func (*endpoint) Wait() {
 	// No-op.
 }
 
+// Wait implements stack.TransportEndpoint.Release.
+func (*endpoint) Release() {
+	// No-op.
+}
+
 // LastError implements tcpip.Endpoint.LastError.
 func (*endpoint) LastError() tcpip.Error {
 	return nil
