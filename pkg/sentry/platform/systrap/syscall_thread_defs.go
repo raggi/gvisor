@@ -18,7 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
-const syscallStubMessageOffset = hostarch.PageSize
+var syscallStubMessageOffset = uintptr(hostarch.PageSize)
 
 // syscallSentryMessage is a shared message that can be changed only from the
 // Sentry and a stub process can only read it.

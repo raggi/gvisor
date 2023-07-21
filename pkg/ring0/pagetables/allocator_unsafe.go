@@ -23,7 +23,7 @@ import (
 // newAlignedPTEs returns a set of aligned PTEs.
 func newAlignedPTEs() *PTEs {
 	ptes := new(PTEs)
-	offset := physicalFor(ptes) & (hostarch.PageSize - 1)
+	offset := physicalFor(ptes) & uintptr(hostarch.PageSize-1)
 	if offset == 0 {
 		// Already aligned.
 		return ptes
@@ -31,9 +31,9 @@ func newAlignedPTEs() *PTEs {
 
 	// Need to force an aligned allocation.
 	unaligned := make([]byte, (2*hostarch.PageSize)-1)
-	offset = uintptr(unsafe.Pointer(&unaligned[0])) & (hostarch.PageSize - 1)
+	offset = uintptr(unsafe.Pointer(&unaligned[0])) & uintptr(hostarch.PageSize-1)
 	if offset != 0 {
-		offset = hostarch.PageSize - offset
+		offset = uintptr(hostarch.PageSize) - offset
 	}
 	return (*PTEs)(unsafe.Pointer(&unaligned[offset]))
 }

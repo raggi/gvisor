@@ -33,7 +33,7 @@ import (
 //
 // Preconditions: mm.as != nil.
 func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, sp hostarch.Addr) error {
-	ar, ok := addr.RoundDown().ToRange(hostarch.PageSize)
+	ar, ok := addr.RoundDown().ToRange(uint64(hostarch.PageSize))
 	if !ok {
 		return linuxerr.EFAULT
 	}

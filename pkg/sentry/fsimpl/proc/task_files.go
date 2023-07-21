@@ -355,7 +355,7 @@ func (d *idMapData) Write(ctx context.Context, _ *vfs.FileDescription, src userm
 	// the system page size, and the write must be performed at the start of
 	// the file ..." - user_namespaces(7)
 	srclen := src.NumBytes()
-	if srclen >= hostarch.PageSize || offset != 0 {
+	if srclen >= int64(hostarch.PageSize) || offset != 0 {
 		return 0, linuxerr.EINVAL
 	}
 	b := make([]byte, srclen)
@@ -683,7 +683,7 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d ", vss, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d ", vss, rss/uint64(hostarch.PageSize))
 
 	// rsslim.
 	fmt.Fprintf(buf, "%d ", s.task.ThreadGroup().Limits().Get(limits.Rss).Cur)
@@ -722,7 +722,7 @@ func (s *statmData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss/hostarch.PageSize, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss/uint64(hostarch.PageSize), rss/uint64(hostarch.PageSize))
 	return nil
 }
 

@@ -33,23 +33,14 @@ import (
 // Host specifies the host architecture.
 const Host = AMD64
 
-// These constants come directly from Linux.
-const (
+var (
 	// maxAddr64 is the maximum userspace address. It is TASK_SIZE in Linux
 	// for a 64-bit process.
-	maxAddr64 hostarch.Addr = (1 << 47) - hostarch.PageSize
-
-	// maxStackRand64 is the maximum randomization to apply to the stack.
-	// It is defined by arch/x86/mm/mmap.c:stack_maxrandom_size in Linux.
-	maxStackRand64 = 16 << 30 // 16 GB
+	maxAddr64 hostarch.Addr = (1 << 47) - hostarch.Addr(hostarch.PageSize)
 
 	// maxMmapRand64 is the maximum randomization to apply to the mmap
 	// layout. It is defined by arch/x86/mm/mmap.c:arch_mmap_rnd in Linux.
 	maxMmapRand64 = (1 << 28) * hostarch.PageSize
-
-	// minGap64 is the minimum gap to leave at the top of the address space
-	// for the stack. It is defined by arch/x86/mm/mmap.c:MIN_GAP in Linux.
-	minGap64 = (128 << 20) + maxStackRand64
 
 	// preferredPIELoadAddr is the standard Linux position-independent
 	// executable base load address. It is ELF_ET_DYN_BASE in Linux.
@@ -57,6 +48,29 @@ const (
 	// The Platform {Min,Max}UserAddress() may preclude loading at this
 	// address. See other preferredFoo comments below.
 	preferredPIELoadAddr hostarch.Addr = maxAddr64 / 3 * 2
+
+	// minMmapRand64 is the smallest we are willing to make the
+	// randomization to stay above preferredTopDownBaseMin.
+	minMmapRand64 = (1 << 26) * hostarch.PageSize
+)
+
+func init() {
+	// The above values need asserting for correctness with other page sizes.
+	if hostarch.PageSize != 4096 {
+		panic("unsupported page size, see issue #8196")
+	}
+}
+
+// These constants come directly from Linux.
+const (
+
+	// maxStackRand64 is the maximum randomization to apply to the stack.
+	// It is defined by arch/x86/mm/mmap.c:stack_maxrandom_size in Linux.
+	maxStackRand64 = 16 << 30 // 16 GB
+
+	// minGap64 is the minimum gap to leave at the top of the address space
+	// for the stack. It is defined by arch/x86/mm/mmap.c:MIN_GAP in Linux.
+	minGap64 = (128 << 20) + maxStackRand64
 )
 
 // These constants are selected as heuristics to help make the Platform's
@@ -95,10 +109,6 @@ const (
 	preferredTopDownAllocMin hostarch.Addr = 0x7e8000000000
 	preferredAllocationGap                 = 128 << 30 // 128 GB
 	preferredTopDownBaseMin                = preferredTopDownAllocMin + preferredAllocationGap
-
-	// minMmapRand64 is the smallest we are willing to make the
-	// randomization to stay above preferredTopDownBaseMin.
-	minMmapRand64 = (1 << 26) * hostarch.PageSize
 )
 
 // Context64 represents an AMD64 context.
@@ -228,12 +238,12 @@ func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (M
 		defaultDir = MmapBottomUp
 	}
 
-	topDownMin := max - gap - maxMmapRand64
+	topDownMin := max - gap - hostarch.Addr(maxMmapRand64)
 	maxRand := hostarch.Addr(maxMmapRand64)
 	if topDownMin < preferredTopDownBaseMin {
 		// Try to keep TopDownBase above preferredTopDownBaseMin by
 		// shrinking maxRand.
-		maxAdjust := maxRand - minMmapRand64
+		maxAdjust := maxRand - hostarch.Addr(minMmapRand64)
 		needAdjust := preferredTopDownBaseMin - topDownMin
 		if needAdjust <= maxAdjust {
 			maxRand -= needAdjust
@@ -266,7 +276,7 @@ func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (M
 // PIELoadAddress implements Context.PIELoadAddress.
 func (c *Context64) PIELoadAddress(l MmapLayout) hostarch.Addr {
 	base := preferredPIELoadAddr
-	max, ok := base.AddLength(maxMmapRand64)
+	max, ok := base.AddLength(uint64(maxMmapRand64))
 	if !ok {
 		panic(fmt.Sprintf("preferredPIELoadAddr %#x too large", base))
 	}
@@ -279,7 +289,7 @@ func (c *Context64) PIELoadAddress(l MmapLayout) hostarch.Addr {
 		base = l.TopDownBase / 3 * 2
 	}
 
-	return base + mmapRand(maxMmapRand64)
+	return base + mmapRand(uint64(maxMmapRand64))
 }
 
 // userStructSize is the size in bytes of Linux's struct user on amd64.

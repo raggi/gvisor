@@ -20,6 +20,8 @@ var (
 
 	// PageShift is the binary log of the system page size.
 	PageShift int
+
+	PageMask int
 )
 
 func init() {
@@ -29,6 +31,7 @@ func init() {
 	if PageSize == 0 {
 		PageSize = 4096
 	}
+	PageMask = PageSize - 1
 
 	PageShift = bits.Len(uint(PageSize)) - 1
 

@@ -179,7 +179,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 		return nil, linuxerr.EINVAL
 	}
 
-	if numPages := sizeAligned / hostarch.PageSize; r.totalPages+numPages > linux.SHMALL {
+	if numPages := sizeAligned / uint64(hostarch.PageSize); r.totalPages+numPages > linux.SHMALL {
 		// "... allocating a segment of the requested size would cause the
 		// system to exceed the system-wide limit on shared memory (SHMALL)."
 		//   - man shmget(2)
@@ -232,7 +232,7 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 	if err := r.reg.Register(shm); err != nil {
 		return nil, err
 	}
-	r.totalPages += effectiveSize / hostarch.PageSize
+	r.totalPages += effectiveSize / uint64(hostarch.PageSize)
 
 	return shm, nil
 }
@@ -278,7 +278,7 @@ func (r *Registry) remove(s *Shm) {
 	}
 
 	r.reg.DissociateID(s.obj.ID)
-	r.totalPages -= s.effectiveSize / hostarch.PageSize
+	r.totalPages -= s.effectiveSize / uint64(hostarch.PageSize)
 }
 
 // Release drops the self-reference of each active shm segment in the registry.

@@ -42,9 +42,9 @@ func (vfs *VirtualFilesystem) NewAnonVirtualDentry(name string) VirtualDentry {
 	}
 }
 
-const (
-	anonfsBlockSize = hostarch.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
+var anonfsBlockSize = hostarch.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
 
+const (
 	// Mode, UID, and GID for a generic anonfs file.
 	anonFileMode = 0600 // no type is correct
 	anonFileUID  = auth.RootKUID
@@ -207,7 +207,7 @@ func (fs *anonFilesystem) StatAt(ctx context.Context, rp *ResolvingPath, opts St
 	// See fs/anon_inodes.c:anon_inode_init() => fs/libfs.c:alloc_anon_inode().
 	return linux.Statx{
 		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS,
-		Blksize:  anonfsBlockSize,
+		Blksize:  uint32(anonfsBlockSize),
 		Nlink:    1,
 		UID:      uint32(anonFileUID),
 		GID:      uint32(anonFileGID),
@@ -227,7 +227,7 @@ func (fs *anonFilesystem) StatFSAt(ctx context.Context, rp *ResolvingPath) (linu
 	}
 	return linux.Statfs{
 		Type:      linux.ANON_INODE_FS_MAGIC,
-		BlockSize: anonfsBlockSize,
+		BlockSize: int64(anonfsBlockSize),
 	}, nil
 }
 

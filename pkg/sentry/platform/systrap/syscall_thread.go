@@ -28,7 +28,7 @@ import (
 )
 
 // The syscall message consists of sentry and stub messages.
-const syscallThreadMessageSize = hostarch.PageSize * 2
+var syscallThreadMessageSize = uint64(hostarch.PageSize * 2)
 
 // syscallThread implements the process of calling syscalls in a stub process.
 //
@@ -95,7 +95,7 @@ func (t *syscallThread) init() error {
 	sentryAddr, _, errno := unix.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
-		syscallThreadMessageSize,
+		uintptr(syscallThreadMessageSize),
 		unix.PROT_WRITE|unix.PROT_READ,
 		unix.MAP_SHARED|unix.MAP_FILE,
 		uintptr(t.subproc.memoryFile.FD()), uintptr(fr.Start))
@@ -114,7 +114,7 @@ func (t *syscallThread) destroy() {
 		_, _, errno := unix.RawSyscall6(
 			unix.SYS_MUNMAP,
 			t.sentryAddr,
-			syscallThreadMessageSize,
+			uintptr(syscallThreadMessageSize),
 			0, 0, 0, 0)
 		if errno != 0 {
 			panic(fmt.Sprintf("mumap failed: %v", errno))
@@ -152,7 +152,7 @@ func (t *syscallThread) mapMessageIntoStub() error {
 		arch.SyscallArgument{Value: uintptr(unix.PROT_READ | unix.PROT_WRITE)},
 		arch.SyscallArgument{Value: unix.MAP_SHARED | unix.MAP_FILE | unix.MAP_FIXED},
 		arch.SyscallArgument{Value: uintptr(t.subproc.memoryFile.FD())},
-		arch.SyscallArgument{Value: uintptr(t.stackRange.Start + hostarch.PageSize)})
+		arch.SyscallArgument{Value: uintptr(t.stackRange.Start + uint64(hostarch.PageSize))})
 	return err
 }
 

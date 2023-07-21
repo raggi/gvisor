@@ -318,10 +318,10 @@ const (
 	chunkShift = 30
 	chunkSize  = 1 << chunkShift // 1 GB
 	chunkMask  = chunkSize - 1
-
-	// maxPage is the highest 64-bit page.
-	maxPage = math.MaxUint64 &^ (hostarch.PageSize - 1)
 )
+
+// maxPage is the highest 64-bit page.
+var maxPage = math.MaxUint64 &^ uint(hostarch.PageSize-1)
 
 // NewMemoryFile creates a MemoryFile backed by the given file. If
 // NewMemoryFile succeeds, ownership of file is transferred to the returned
@@ -388,7 +388,7 @@ func IMAWorkAroundForMemFile(fd uintptr) {
 	m, _, errno := unix.Syscall6(
 		unix.SYS_MMAP,
 		0,
-		hostarch.PageSize,
+		uintptr(hostarch.PageSize),
 		unix.PROT_EXEC,
 		unix.MAP_SHARED,
 		fd,
@@ -401,7 +401,7 @@ func IMAWorkAroundForMemFile(fd uintptr) {
 		if _, _, errno := unix.Syscall(
 			unix.SYS_MUNMAP,
 			m,
-			hostarch.PageSize,
+			uintptr(hostarch.PageSize),
 			0); errno != 0 {
 			panic(fmt.Sprintf("failed to unmap PROT_EXEC MemoryFile mapping: %v", errno))
 		}
@@ -534,7 +534,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 }
 
 func (f *MemoryFile) allocate(length uint64, opts *AllocOpts) (memmap.FileRange, error) {
-	if length == 0 || length%hostarch.PageSize != 0 {
+	if length == 0 || length%uint64(hostarch.PageSize) != 0 {
 		panic(fmt.Sprintf("invalid allocation length: %#x", length))
 	}
 
@@ -707,7 +707,7 @@ func tryPopulateMadv(b safemem.Block) bool {
 	// Only call madvise(MADV_POPULATE_WRITE) if >=2 pages are being populated.
 	// 1 syscall overhead >= 1 page fault overhead. This is because syscalls are
 	// susceptible to additional overheads like seccomp-bpf filters and auditing.
-	if start >= end || bLen <= hostarch.PageSize {
+	if start >= end || bLen <= hostarch.Addr(hostarch.PageSize) {
 		return true
 	}
 	_, _, errno := unix.RawSyscall(unix.SYS_MADVISE, uintptr(start), uintptr(bLen), unix.MADV_POPULATE_WRITE)
@@ -795,7 +795,7 @@ const (
 //
 // Preconditions: fr.Length() > 0.
 func (f *MemoryFile) Decommit(fr memmap.FileRange) error {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%uint64(hostarch.PageSize) != 0 || fr.End%uint64(hostarch.PageSize) != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -868,7 +868,7 @@ func (f *MemoryFile) markDecommitted(fr memmap.FileRange) {
 
 // IncRef implements memmap.File.IncRef.
 func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%uint64(hostarch.PageSize) != 0 || fr.End%uint64(hostarch.PageSize) != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -887,7 +887,7 @@ func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 
 // DecRef implements memmap.File.DecRef.
 func (f *MemoryFile) DecRef(fr memmap.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%uint64(hostarch.PageSize) != 0 || fr.End%uint64(hostarch.PageSize) != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 

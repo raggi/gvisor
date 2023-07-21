@@ -102,7 +102,7 @@ func fillAddressSpace() (excludedRegions []region) {
 			0, 0)
 		if errno != 0 {
 			// One page is the smallest mapping that can be allocated.
-			if current == hostarch.PageSize {
+			if current == uintptr(hostarch.PageSize) {
 				current = 0
 				break
 			}
@@ -158,8 +158,8 @@ func computePhysicalRegions(excludedRegions []region) (physicalRegions []physica
 			return
 		}
 		if virtual == 0 {
-			virtual += hostarch.PageSize
-			length -= hostarch.PageSize
+			virtual += uintptr(hostarch.PageSize)
+			length -= uintptr(hostarch.PageSize)
 		}
 		if end := virtual + length; end > ring0.MaximumUserAddress {
 			length -= (end - ring0.MaximumUserAddress)

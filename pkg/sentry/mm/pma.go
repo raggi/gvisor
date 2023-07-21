@@ -359,10 +359,10 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						// being able to do much. So only copy up to one page
 						// before and after the pages required.
 						stackMaskAR := ar
-						if newStart := stackMaskAR.Start - hostarch.PageSize; newStart < stackMaskAR.Start {
+						if newStart := stackMaskAR.Start - hostarch.Addr(hostarch.PageSize); newStart < stackMaskAR.Start {
 							stackMaskAR.Start = newStart
 						}
-						if newEnd := stackMaskAR.End + hostarch.PageSize; newEnd > stackMaskAR.End {
+						if newEnd := stackMaskAR.End + hostarch.Addr(hostarch.PageSize); newEnd > stackMaskAR.End {
 							stackMaskAR.End = newEnd
 						}
 						copyAR = pseg.Range().Intersect(stackMaskAR)

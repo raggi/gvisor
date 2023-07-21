@@ -206,7 +206,7 @@ func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor
 	a.uid.Store(uint32(creds.EffectiveKUID))
 	a.gid.Store(uint32(creds.EffectiveKGID))
 	a.nlink.Store(nlink)
-	a.blockSize.Store(hostarch.PageSize)
+	a.blockSize.Store(uint32(hostarch.PageSize))
 	now := ktime.NowFromContext(ctx).Nanoseconds()
 	a.atime.Store(now)
 	a.mtime.Store(now)

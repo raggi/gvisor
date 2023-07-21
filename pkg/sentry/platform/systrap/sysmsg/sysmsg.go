@@ -49,23 +49,23 @@ import (
 // |------------|
 // |   sysmsg   |
 // *------------*
-const (
+var (
 	// PerThreadMemSize is the size of a per-thread memory region.
-	PerThreadMemSize = 8 * hostarch.PageSize
+	PerThreadMemSize = 8 * uintptr(hostarch.PageSize)
 	// GuardSize is the size of an unmapped region which is placed right
 	// before the signal stack.
-	GuardSize                   = hostarch.PageSize
+	GuardSize                   = uintptr(hostarch.PageSize)
 	PerThreadPrivateStackOffset = GuardSize
-	PerThreadPrivateStackSize   = 2 * hostarch.PageSize
+	PerThreadPrivateStackSize   = 2 * uintptr(hostarch.PageSize)
 	// PerThreadStackSharedSize is the size of a per-thread stack region.
-	PerThreadSharedStackSize   = 4 * hostarch.PageSize
-	PerThreadSharedStackOffset = 4 * hostarch.PageSize
+	PerThreadSharedStackSize   = 4 * uintptr(hostarch.PageSize)
+	PerThreadSharedStackOffset = 4 * uintptr(hostarch.PageSize)
 	// MsgOffsetFromStack is the offset of the Msg structure on
 	// the thread stack.
-	MsgOffsetFromSharedStack = PerThreadMemSize - hostarch.PageSize - PerThreadSharedStackOffset
+	MsgOffsetFromSharedStack = PerThreadMemSize - uintptr(hostarch.PageSize) - PerThreadSharedStackOffset
 
 	// SpinningQueueMemSize is the size of a spinning queue memory region.
-	SpinningQueueMemSize = hostarch.PageSize
+	SpinningQueueMemSize = uintptr(hostarch.PageSize)
 )
 
 // StackAddrToMsg returns an address of a sysmsg structure.

@@ -259,7 +259,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 		rootKGID = kgid
 	}
-	maxSizeInPages := getDefaultSizeLimit(disableDefaultSizeLimit) / hostarch.PageSize
+	maxSizeInPages := getDefaultSizeLimit(disableDefaultSizeLimit) / uint64(hostarch.PageSize)
 	maxSizeStr, ok := mopts["size"]
 	if ok {
 		delete(mopts, "size")
@@ -365,8 +365,8 @@ func (d *dentry) releaseChildrenLocked(ctx context.Context) {
 func (fs *filesystem) statFS() linux.Statfs {
 	st := linux.Statfs{
 		Type:         linux.TMPFS_MAGIC,
-		BlockSize:    hostarch.PageSize,
-		FragmentSize: hostarch.PageSize,
+		BlockSize:    int64(hostarch.PageSize),
+		FragmentSize: int64(hostarch.PageSize),
 		NameLength:   linux.NAME_MAX,
 	}
 
@@ -605,7 +605,7 @@ func (i *inode) statTo(stat *linux.Statx) {
 		linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE |
 		linux.STATX_BLOCKS | linux.STATX_ATIME | linux.STATX_CTIME |
 		linux.STATX_MTIME
-	stat.Blksize = hostarch.PageSize
+	stat.Blksize = uint32(hostarch.PageSize)
 	stat.Nlink = i.nlink.Load()
 	stat.UID = i.uid.Load()
 	stat.GID = i.gid.Load()

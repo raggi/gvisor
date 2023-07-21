@@ -346,7 +346,7 @@ func (mm *MemoryManager) getVecVMAsLocked(ctx context.Context, ars hostarch.Addr
 //
 // guardBytes is equivalent to Linux's stack_guard_gap after upstream
 // 1be7107fbe18 "mm: larger stack guard gap, between vmas".
-const guardBytes = 256 * hostarch.PageSize
+var guardBytes = hostarch.Addr(256 * hostarch.PageSize)
 
 // unmapLocked unmaps all addresses in ar and returns the resulting gap in
 // mm.vmas.

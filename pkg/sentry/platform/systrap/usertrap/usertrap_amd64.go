@@ -129,7 +129,7 @@ func (s *State) newTrapLocked(ctx context.Context, mm memoryManager) (hostarch.A
 
 	// An entire trap has to be on the same page to avoid memory faults.
 	addr := s.trapAddr(trap)
-	if addr/hostarch.PageSize != (addr+trapSize)/hostarch.PageSize {
+	if addr/hostarch.Addr(hostarch.PageSize) != (addr+trapSize)/hostarch.Addr(hostarch.PageSize) {
 		trap = s.nextTrap
 		s.nextTrap++
 	}

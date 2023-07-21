@@ -130,7 +130,7 @@ func (kcov *Kcov) InitTrace(size uint64) error {
 
 	// To simplify all the logic around mapping, we require that the length of the
 	// shared region is a multiple of the system page size.
-	if (8*size)&(hostarch.PageSize-1) != 0 {
+	if (8*size)&uint64(hostarch.PageSize-1) != 0 {
 		return linuxerr.EINVAL
 	}
 

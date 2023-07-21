@@ -27,18 +27,20 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-const (
+var (
 	// MinimumPipeSize is a hard limit of the minimum size of a pipe.
 	// It corresponds to fs/pipe.c:pipe_min_size.
 	MinimumPipeSize = hostarch.PageSize
 
-	// MaximumPipeSize is a hard limit on the maximum size of a pipe.
-	// It corresponds to fs/pipe.c:pipe_max_size.
-	MaximumPipeSize = 1048576
-
 	// DefaultPipeSize is the system-wide default size of a pipe in bytes.
 	// It corresponds to pipe_fs_i.h:PIPE_DEF_BUFFERS.
 	DefaultPipeSize = 16 * hostarch.PageSize
+)
+
+const (
+	// MaximumPipeSize is a hard limit on the maximum size of a pipe.
+	// It corresponds to fs/pipe.c:pipe_max_size.
+	MaximumPipeSize = 1048576
 
 	// atomicIOBytes is the maximum number of bytes that the pipe will
 	// guarantee atomic reads or writes atomically.
@@ -169,8 +171,8 @@ func NewPipe(isNamed bool, sizeBytes int64) *Pipe {
 }
 
 func initPipe(pipe *Pipe, isNamed bool, sizeBytes int64) {
-	if sizeBytes < MinimumPipeSize {
-		sizeBytes = MinimumPipeSize
+	if sizeBytes < int64(MinimumPipeSize) {
+		sizeBytes = int64(MinimumPipeSize)
 	}
 	if sizeBytes > MaximumPipeSize {
 		sizeBytes = MaximumPipeSize
@@ -443,8 +445,8 @@ func (p *Pipe) SetFifoSize(size int64) (int64, error) {
 	if size < 0 {
 		return 0, linuxerr.EINVAL
 	}
-	if size < MinimumPipeSize {
-		size = MinimumPipeSize // Per spec.
+	if size < int64(MinimumPipeSize) {
+		size = int64(MinimumPipeSize) // Per spec.
 	}
 	if size > MaximumPipeSize {
 		return 0, linuxerr.EPERM

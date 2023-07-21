@@ -84,7 +84,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 func (fd *specialFileFD) savePipeData(ctx context.Context) error {
 	fd.bufMu.Lock()
 	defer fd.bufMu.Unlock()
-	var buf [hostarch.PageSize]byte
+	var buf = make([]byte, hostarch.PageSize)
 	for {
 		n, err := fd.handle.readToBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:])), ^uint64(0))
 		if n != 0 {

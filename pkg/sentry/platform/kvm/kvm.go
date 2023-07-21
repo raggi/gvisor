@@ -154,7 +154,7 @@ func (*KVM) MapUnit() uint64 {
 
 // MinUserAddress returns the lowest available address.
 func (*KVM) MinUserAddress() hostarch.Addr {
-	return hostarch.PageSize
+	return hostarch.Addr(hostarch.PageSize)
 }
 
 // MaxUserAddress returns the first address that may not be used.

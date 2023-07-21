@@ -899,7 +899,7 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 				mode: opts.Mode,
 				kuid: creds.EffectiveKUID,
 				kgid: creds.EffectiveKGID,
-				pipe: pipe.NewVFSPipe(true /* isNamed */, pipe.DefaultPipeSize),
+				pipe: pipe.NewVFSPipe(true /* isNamed */, int64(pipe.DefaultPipeSize)),
 			}), nil
 		}
 		// Retain error from gofer if synthetic file cannot be created internally.

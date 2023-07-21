@@ -55,7 +55,7 @@ const (
 )
 
 func pagesInChunk(mr memmap.MappableRange, chunkStart uint64) int32 {
-	return int32(mr.Intersect(memmap.MappableRange{chunkStart, chunkStart + chunkSize}).Length() / hostarch.PageSize)
+	return int32(mr.Intersect(memmap.MappableRange{chunkStart, chunkStart + chunkSize}).Length() / uint64(hostarch.PageSize))
 }
 
 type mapping struct {

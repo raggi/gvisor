@@ -41,7 +41,7 @@ func (k *Kernel) init(maxCPUs int) {
 		entries = make([]kernelEntry, maxCPUs+padding-1)
 		totalSize := entrySize * uintptr(maxCPUs+padding-1)
 		addr := reflect.ValueOf(&entries[0]).Pointer()
-		if addr&(hostarch.PageSize-1) == 0 && totalSize >= hostarch.PageSize {
+		if addr&uintptr(hostarch.PageSize-1) == 0 && totalSize >= uintptr(hostarch.PageSize) {
 			// The runtime forces power-of-2 alignment for allocations, and we are therefore
 			// safe once the first address is aligned and the chunk is at least a full page.
 			break
@@ -51,10 +51,10 @@ func (k *Kernel) init(maxCPUs int) {
 	k.cpuEntries = entries
 
 	k.globalIDT = &idt64{}
-	if reflect.TypeOf(idt64{}).Size() != hostarch.PageSize {
+	if reflect.TypeOf(idt64{}).Size() != uintptr(hostarch.PageSize) {
 		panic("Size of globalIDT should be PageSize")
 	}
-	if reflect.ValueOf(k.globalIDT).Pointer()&(hostarch.PageSize-1) != 0 {
+	if reflect.ValueOf(k.globalIDT).Pointer()&uintptr(hostarch.PageSize-1) != 0 {
 		panic("Allocated globalIDT should be page aligned")
 	}
 

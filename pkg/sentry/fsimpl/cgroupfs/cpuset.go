@@ -106,7 +106,7 @@ func (d *cpusData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 
 // WriteBackground implements writableControllerFileImpl.WriteBackground.
 func (d *cpusData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
@@ -154,7 +154,7 @@ func (d *memsData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 
 // WriteBackground implements writableControllerFileImpl.WriteBackground.
 func (d *memsData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 

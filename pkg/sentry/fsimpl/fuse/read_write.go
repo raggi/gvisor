@@ -170,8 +170,8 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 		// Limit the write size to one page.
 		// Note that the bigWrites flag is obsolete,
 		// latest libfuse always sets it on.
-		if !fs.conn.bigWrites && writeSize > hostarch.PageSize {
-			writeSize = hostarch.PageSize
+		if !fs.conn.bigWrites && writeSize > uint32(hostarch.PageSize) {
+			writeSize = uint32(hostarch.PageSize)
 		}
 		// Limit the write size to maxWrite.
 		if writeSize > maxWrite {

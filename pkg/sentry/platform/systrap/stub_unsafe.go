@@ -127,12 +127,12 @@ func stubInit() {
 	mapLen, _ = hostarch.PageRoundUp(mapLen + uintptr(stubSysmsgLen))
 
 	stubSysmsgRules = mapLen
-	stubSysmsgRulesLen = hostarch.PageSize * 4
+	stubSysmsgRulesLen = uintptr(hostarch.PageSize * 4)
 	mapLen += stubSysmsgRulesLen
 
 	stubROMapEnd = mapLen
 	// Add a guard page.
-	mapLen += hostarch.PageSize
+	mapLen += uintptr(hostarch.PageSize)
 	stubSysmsgStack = mapLen
 
 	// Allocate maxGuestThreads plus ONE because each per-thread stack
@@ -154,10 +154,10 @@ func stubInit() {
 	mapLen, _ = hostarch.PageRoundUp(mapLen + stubContextRegionLen)
 
 	// Randomize stubStart address.
-	randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
+	randomOffset := uintptr(rand.Uint64() * uint64(hostarch.PageSize))
 	maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
 	stubStart = uintptr(0)
-	for offset := uintptr(0); offset < maxRandomOffset; offset += hostarch.PageSize {
+	for offset := uintptr(0); offset < maxRandomOffset; offset += uintptr(hostarch.PageSize) {
 		stubStart = maxStubUserAddress + (randomOffset+offset)%maxRandomOffset
 		// Map the target address for the stub.
 		//
@@ -188,7 +188,7 @@ func stubInit() {
 		panic("failed to map stub")
 	}
 	// Randomize stubSysmsgStack address.
-	gap := uintptr(rand.Uint64()) * hostarch.PageSize % (maximumUserAddress - stubStart - mapLen)
+	gap := uintptr(rand.Uint64()) * uintptr(hostarch.PageSize) % (maximumUserAddress - stubStart - mapLen)
 	stubSysmsgStack += uintptr(gap)
 	stubContextQueueRegion += uintptr(gap)
 	stubContextRegion += uintptr(gap)

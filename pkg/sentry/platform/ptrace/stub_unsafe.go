@@ -52,8 +52,8 @@ func stubInit() {
 	stubLen := int(safecopy.FindEndAddress(stubBegin) - stubBegin)
 	stubSlice := unsafeSlice(stubBegin, stubLen)
 	mapLen := uintptr(stubLen)
-	if offset := mapLen % hostarch.PageSize; offset != 0 {
-		mapLen += hostarch.PageSize - offset
+	if offset := mapLen % uintptr(hostarch.PageSize); offset != 0 {
+		mapLen += uintptr(hostarch.PageSize) - offset
 	}
 
 	for stubStart > 0 {

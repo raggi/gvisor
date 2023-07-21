@@ -181,7 +181,7 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 	i.uid.Store(uint32(creds.EffectiveKUID))
 	i.gid.Store(uint32(creds.EffectiveKGID))
 	i.nlink.Store(nlink)
-	i.blockSize.Store(hostarch.PageSize)
+	i.blockSize.Store(uint32(hostarch.PageSize))
 
 	now := i.fs.clock.Now().Nanoseconds()
 	i.atime.Store(now)
