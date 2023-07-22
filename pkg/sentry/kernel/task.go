@@ -20,17 +20,17 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -62,7 +62,7 @@ type Task struct {
 	// but since it's used to detect cases where non-task goroutines
 	// incorrectly access state owned by, or exclusive to, the task goroutine,
 	// goid is always accessed using atomic memory operations.
-	goid int64 `state:"nosave"`
+	goid atomicbitops.Int64 `state:"nosave"`
 
 	// runState is what the task goroutine is executing if it is not stopped.
 	// If runState is nil, the task goroutine should exit or has exited.
@@ -71,12 +71,10 @@ type Task struct {
 
 	// taskWorkCount represents the current size of the task work queue. It is
 	// used to avoid acquiring taskWorkMu when the queue is empty.
-	//
-	// Must accessed with atomic memory operations.
-	taskWorkCount int32
+	taskWorkCount atomicbitops.Int32
 
 	// taskWorkMu protects taskWork.
-	taskWorkMu sync.Mutex `state:"nosave"`
+	taskWorkMu taskWorkMutex `state:"nosave"`
 
 	// taskWork is a queue of work to be executed before resuming user execution.
 	// It is similar to the task_work mechanism in Linux.
@@ -111,7 +109,7 @@ type Task struct {
 	//
 	// yieldCount is accessed using atomic memory operations. yieldCount is
 	// owned by the task goroutine.
-	yieldCount uint64
+	yieldCount atomicbitops.Uint64
 
 	// pendingSignals is the set of pending signals that may be handled only by
 	// this task.
@@ -128,7 +126,7 @@ type Task struct {
 	// signal mutex is locked or if atomic memory operations are used, while
 	// writing signalMask requires both). signalMask is owned by the task
 	// goroutine.
-	signalMask linux.SignalSet
+	signalMask atomicbitops.Uint64
 
 	// If the task goroutine is currently executing Task.sigtimedwait,
 	// realSignalMask is the previous value of signalMask, which has temporarily
@@ -218,7 +216,7 @@ type Task struct {
 	// stop; after a save/restore cycle, the restored sentry has no knowledge
 	// of the pre-save sentryctl command, and the stopped task would remain
 	// stopped forever.)
-	stopCount int32 `state:"nosave"`
+	stopCount atomicbitops.Int32 `state:"nosave"`
 
 	// endStopCond is signaled when stopCount transitions to 0. The combination
 	// of stopCount and endStopCond effectively form a sync.WaitGroup, but
@@ -256,7 +254,7 @@ type Task struct {
 	containerID string
 
 	// mu protects some of the following fields.
-	mu sync.Mutex `state:"nosave"`
+	mu taskMutex `state:"nosave"`
 
 	// image holds task data provided by the ELF loader.
 	//
@@ -448,10 +446,10 @@ type Task struct {
 	// abstractSockets is protected by mu.
 	abstractSockets *AbstractSocketNamespace
 
-	// mountNamespaceVFS2 is the task's mount namespace.
+	// mountNamespace is the task's mount namespace.
 	//
 	// It is protected by mu. It is owned by the task goroutine.
-	mountNamespaceVFS2 *vfs.MountNamespace
+	mountNamespace *vfs.MountNamespace
 
 	// parentDeathSignal is sent to this task's thread group when its parent exits.
 	//
@@ -483,9 +481,7 @@ type Task struct {
 
 	// cpu is the fake cpu number returned by getcpu(2). cpu is ignored
 	// entirely if Kernel.useHostCores is true.
-	//
-	// cpu is accessed using atomic memory operations.
-	cpu int32
+	cpu atomicbitops.Int32
 
 	// This is used to keep track of changes made to a process' priority/niceness.
 	// It is mostly used to provide some reasonable return value from
@@ -592,12 +588,28 @@ type Task struct {
 	// +checklocks:mu
 	cgroups map[Cgroup]struct{}
 
+	// memCgID is the memory cgroup id.
+	memCgID atomicbitops.Uint32
+
 	// userCounters is a pointer to a set of user counters.
 	//
 	// The userCounters pointer is exclusive to the task goroutine, but the
 	// userCounters instance must be atomically accessed.
 	userCounters *userCounters
 }
+
+// Task related metrics
+var (
+	// syscallCounter is a metric that tracks how many syscalls the sentry has
+	// executed.
+	syscallCounter = metric.MustCreateNewProfilingUint64Metric(
+		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
+
+	// faultCounter is a metric that tracks how many faults the sentry has had to
+	// handle.
+	faultCounter = metric.MustCreateNewProfilingUint64Metric(
+		"/task/faults", false, "The number of faults the sentry has handled.")
+)
 
 func (t *Task) savePtraceTracer() *Task {
 	return t.ptraceTracer.Load().(*Task)
@@ -624,7 +636,7 @@ func (t *Task) afterLoad() {
 	t.interruptChan = make(chan struct{}, 1)
 	t.gosched.State = TaskGoroutineNonexistent
 	if t.stop != nil {
-		t.stopCount = 1
+		t.stopCount = atomicbitops.FromInt32(1)
 	}
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	t.rseqPreempted = true
@@ -695,19 +707,9 @@ func (t *Task) SyscallRestartBlock() SyscallRestartBlock {
 // Preconditions: The caller must be running on the task goroutine, or t.mu
 // must be locked.
 func (t *Task) IsChrooted() bool {
-	if VFS2Enabled {
-		realRoot := t.mountNamespaceVFS2.Root()
-		root := t.fsContext.RootDirectoryVFS2()
-		defer root.DecRef(t)
-		return root != realRoot
-	}
-
-	realRoot := t.tg.mounts.Root()
-	defer realRoot.DecRef(t)
+	realRoot := t.mountNamespace.Root()
 	root := t.fsContext.RootDirectory()
-	if root != nil {
-		defer root.DecRef(t)
-	}
+	defer root.DecRef(t)
 	return root != realRoot
 }
 
@@ -740,16 +742,8 @@ func (t *Task) FDTable() *FDTable {
 // GetFile is a convenience wrapper for t.FDTable().Get.
 //
 // Precondition: same as FDTable.Get.
-func (t *Task) GetFile(fd int32) *fs.File {
+func (t *Task) GetFile(fd int32) *vfs.FileDescription {
 	f, _ := t.fdTable.Get(fd)
-	return f
-}
-
-// GetFileVFS2 is a convenience wrapper for t.FDTable().GetVFS2.
-//
-// Precondition: same as FDTable.Get.
-func (t *Task) GetFileVFS2(fd int32) *vfs.FileDescription {
-	f, _ := t.fdTable.GetVFS2(fd)
 	return f
 }
 
@@ -758,39 +752,17 @@ func (t *Task) GetFileVFS2(fd int32) *vfs.FileDescription {
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.
-func (t *Task) NewFDs(fd int32, files []*fs.File, flags FDFlags) ([]int32, error) {
+func (t *Task) NewFDs(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
 	return t.fdTable.NewFDs(t, fd, files, flags)
 }
 
-// NewFDsVFS2 is a convenience wrapper for t.FDTable().NewFDsVFS2.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDsVFS2(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
-	return t.fdTable.NewFDsVFS2(t, fd, files, flags)
-}
-
-// NewFDFrom is a convenience wrapper for t.FDTable().NewFDs with a single file.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDFrom(fd int32, file *fs.File, flags FDFlags) (int32, error) {
-	fds, err := t.fdTable.NewFDs(t, fd, []*fs.File{file}, flags)
-	if err != nil {
-		return 0, err
-	}
-	return fds[0], nil
-}
-
-// NewFDFromVFS2 is a convenience wrapper for t.FDTable().NewFDVFS2.
+// NewFDFrom is a convenience wrapper for t.FDTable().NewFD.
 //
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.Get.
-func (t *Task) NewFDFromVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
-	return t.fdTable.NewFDVFS2(t, fd, file, flags)
+func (t *Task) NewFDFrom(minFD int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
+	return t.fdTable.NewFD(t, minFD, file, flags)
 }
 
 // NewFDAt is a convenience wrapper for t.FDTable().NewFDAt.
@@ -798,17 +770,8 @@ func (t *Task) NewFDFromVFS2(fd int32, file *vfs.FileDescription, flags FDFlags)
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.
-func (t *Task) NewFDAt(fd int32, file *fs.File, flags FDFlags) error {
+func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) error {
 	return t.fdTable.NewFDAt(t, fd, file, flags)
-}
-
-// NewFDAtVFS2 is a convenience wrapper for t.FDTable().NewFDAtVFS2.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDAtVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) error {
-	return t.fdTable.NewFDAtVFS2(t, fd, file, flags)
 }
 
 // WithMuLocked executes f with t.mu locked.
@@ -818,18 +781,12 @@ func (t *Task) WithMuLocked(f func(*Task)) {
 	t.mu.Unlock()
 }
 
-// MountNamespace returns t's MountNamespace. MountNamespace does not take an
-// additional reference on the returned MountNamespace.
-func (t *Task) MountNamespace() *fs.MountNamespace {
-	return t.tg.mounts
-}
-
-// MountNamespaceVFS2 returns t's MountNamespace. A reference is taken on the
+// MountNamespace returns t's MountNamespace. A reference is taken on the
 // returned mount namespace.
-func (t *Task) MountNamespaceVFS2() *vfs.MountNamespace {
+func (t *Task) MountNamespace() *vfs.MountNamespace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.mountNamespaceVFS2
+	return t.mountNamespace
 }
 
 // AbstractSockets returns t's AbstractSocketNamespace.
@@ -844,7 +801,7 @@ func (t *Task) ContainerID() string {
 
 // OOMScoreAdj gets the task's thread group's OOM score adjustment.
 func (t *Task) OOMScoreAdj() int32 {
-	return atomic.LoadInt32(&t.tg.oomScoreAdj)
+	return t.tg.oomScoreAdj.Load()
 }
 
 // SetOOMScoreAdj sets the task's thread group's OOM score adjustment. The
@@ -853,7 +810,7 @@ func (t *Task) SetOOMScoreAdj(adj int32) error {
 	if adj > 1000 || adj < -1000 {
 		return linuxerr.EINVAL
 	}
-	atomic.StoreInt32(&t.tg.oomScoreAdj, adj)
+	t.tg.oomScoreAdj.Store(adj)
 	return nil
 }
 
@@ -877,25 +834,5 @@ func (t *Task) ResetKcov() {
 	if t.kcov != nil {
 		t.kcov.OnTaskExit()
 		t.kcov = nil
-	}
-}
-
-// Preconditions: The TaskSet mutex must be locked.
-func (t *Task) loadSeccheckInfoLocked(req seccheck.TaskFieldSet, mask *seccheck.TaskFieldSet, info *seccheck.TaskInfo) {
-	if req.Contains(seccheck.TaskFieldThreadID) {
-		info.ThreadID = int32(t.k.tasks.Root.tids[t])
-		mask.Add(seccheck.TaskFieldThreadID)
-	}
-	if req.Contains(seccheck.TaskFieldThreadStartTime) {
-		info.ThreadStartTime = t.startTime
-		mask.Add(seccheck.TaskFieldThreadStartTime)
-	}
-	if req.Contains(seccheck.TaskFieldThreadGroupID) {
-		info.ThreadGroupID = int32(t.k.tasks.Root.tgids[t.tg])
-		mask.Add(seccheck.TaskFieldThreadGroupID)
-	}
-	if req.Contains(seccheck.TaskFieldThreadGroupStartTime) {
-		info.ThreadGroupStartTime = t.tg.leader.startTime
-		mask.Add(seccheck.TaskFieldThreadGroupStartTime)
 	}
 }

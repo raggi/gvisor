@@ -22,6 +22,21 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
+// fxrstor restores floating point state.
+func fxrstor(addr uintptr)
+
+// xrstor restores floating point state.
+func xrstor(addr uintptr)
+
+// fxsave saves floating point state.
+func fxsave(addr uintptr)
+
+// xsave saves floating point state.
+func xsave(addr uintptr)
+
+// xsaveopt saves floating point state.
+func xsaveopt(addr uintptr)
+
 // writeFS sets the FS base address (selects one of wrfsbase or wrfsmsr).
 func writeFS(addr uintptr)
 
@@ -78,12 +93,18 @@ var (
 
 // Init sets function pointers based on architectural features.
 //
-// This must be called prior to using ring0. By default, it will be called by
-// the init() function. However, it may be called at another time with a
-// different FeatureSet.
+// This must be called prior to using ring0. It may be called with the
+// auto-detected feature set using InitDefault. It may also be called at
+// another time with a  different FeatureSet.
 func Init(fs cpuid.FeatureSet) {
 	// Initialize all sizes.
 	VirtualAddressBits = uintptr(fs.VirtualAddressBits())
+	// TODO(gvisor.dev/issue/7349): introduce support for 5-level paging.
+	// Four-level page tables allows to address up to 48-bit virtual
+	// addresses.
+	if VirtualAddressBits > 48 {
+		VirtualAddressBits = 48
+	}
 	PhysicalAddressBits = uintptr(fs.PhysicalAddressBits())
 	UserspaceSize = uintptr(1) << (VirtualAddressBits - 1)
 	MaximumUserAddress = (UserspaceSize - 1) & ^uintptr(hostarch.PageSize-1)
@@ -102,7 +123,8 @@ func Init(fs cpuid.FeatureSet) {
 	}
 }
 
-func init() {
-	// See Init, above.
+// InitDefault initializes ring0 with the auto-detected host feature set.
+func InitDefault() {
+	cpuid.Initialize()
 	Init(cpuid.HostFeatureSet())
 }

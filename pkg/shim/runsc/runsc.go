@@ -69,6 +69,7 @@ type Runsc struct {
 	Root         string
 	Log          string
 	LogFormat    runc.Format
+	PanicLog     string
 	Config       map[string]string
 }
 
@@ -485,6 +486,9 @@ func (r *Runsc) args() []string {
 	}
 	if r.LogFormat != "" {
 		args = append(args, fmt.Sprintf("--log-format=%s", r.LogFormat))
+	}
+	if r.PanicLog != "" {
+		args = append(args, fmt.Sprintf("--panic-log=%s", r.PanicLog))
 	}
 	for k, v := range r.Config {
 		args = append(args, fmt.Sprintf("--%s=%s", k, v))

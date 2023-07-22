@@ -34,7 +34,8 @@ import (
 // +stateify savable
 type cpusetController struct {
 	controllerCommon
-	controllerNoopMigrate
+	controllerStateless
+	controllerNoResource
 
 	maxCpus uint32
 	maxMems uint32
@@ -59,12 +60,14 @@ func newCPUSetController(k *kernel.Kernel, fs *filesystem) *cpusetController {
 		maxCpus: uint32(k.ApplicationCores()),
 		maxMems: 1, // We always report a single NUMA node.
 	}
-	c.controllerCommon.init(controllerCPUSet, fs)
+	c.controllerCommon.init(kernel.CgroupControllerCPUSet, fs)
 	return c
 }
 
 // Clone implements controller.Clone.
 func (c *cpusetController) Clone() controller {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	cpus := c.cpus.Clone()
 	mems := c.mems.Clone()
 	new := &cpusetController{
@@ -73,14 +76,14 @@ func (c *cpusetController) Clone() controller {
 		cpus:    &cpus,
 		mems:    &mems,
 	}
-	new.controllerCommon.cloneFrom(&c.controllerCommon)
+	new.controllerCommon.cloneFromParent(c)
 	return new
 }
 
 // AddControlFiles implements controller.AddControlFiles.
 func (c *cpusetController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
-	contents["cpuset.cpus"] = c.fs.newControllerWritableFile(ctx, creds, &cpusData{c: c})
-	contents["cpuset.mems"] = c.fs.newControllerWritableFile(ctx, creds, &memsData{c: c})
+	contents["cpuset.cpus"] = c.fs.newControllerWritableFile(ctx, creds, &cpusData{c: c}, true)
+	contents["cpuset.mems"] = c.fs.newControllerWritableFile(ctx, creds, &memsData{c: c}, true)
 }
 
 // +stateify savable
@@ -98,12 +101,16 @@ func (d *cpusData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (d *cpusData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	return d.WriteBackground(ctx, src)
+}
+
+// WriteBackground implements writableControllerFileImpl.WriteBackground.
+func (d *cpusData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
-	t := kernel.TaskFromContext(ctx)
-	buf := t.CopyScratchBuffer(hostarch.PageSize)
+	buf := copyScratchBufferFromContext(ctx, hostarch.PageSize)
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, err
@@ -142,12 +149,16 @@ func (d *memsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (d *memsData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	return d.WriteBackground(ctx, src)
+}
+
+// WriteBackground implements writableControllerFileImpl.WriteBackground.
+func (d *memsData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
-	t := kernel.TaskFromContext(ctx)
-	buf := t.CopyScratchBuffer(hostarch.PageSize)
+	buf := copyScratchBufferFromContext(ctx, hostarch.PageSize)
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, err

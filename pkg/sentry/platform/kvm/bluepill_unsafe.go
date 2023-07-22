@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.12
-// +build go1.12
+//go:build go1.18
+// +build go1.18
 
 // //go:linkname directives type-checked by checklinkname. Any other
 // non-linkname assumptions outside the Go 1 compatibility guarantee should
@@ -22,7 +22,6 @@
 package kvm
 
 import (
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -65,20 +64,35 @@ func bluepillArchContext(context unsafe.Pointer) *arch.SignalContext64 {
 //go:nosplit
 func bluepillGuestExit(c *vCPU, context unsafe.Pointer) {
 	// Increment our counter.
-	atomic.AddUint64(&c.guestExits, 1)
+	c.guestExits.Add(1)
 
 	// Copy out registers.
 	bluepillArchExit(c, bluepillArchContext(context))
 
 	// Return to the vCPUReady state; notify any waiters.
-	user := atomic.LoadUint32(&c.state) & vCPUUser
-	switch atomic.SwapUint32(&c.state, user) {
+	user := c.state.Load() & vCPUUser
+	switch c.state.Swap(user) {
 	case user | vCPUGuest: // Expected case.
 	case user | vCPUGuest | vCPUWaiter:
 		c.notify()
 	default:
 		throw("invalid state")
 	}
+}
+
+var hexSyms = []byte("0123456789abcdef")
+
+//go:nosplit
+func printHex(title []byte, val uint64) {
+	var str [18]byte
+	for i := 0; i < 16; i++ {
+		str[16-i] = hexSyms[val&0xf]
+		val = val >> 4
+	}
+	str[0] = ' '
+	str[17] = '\n'
+	unix.RawSyscall(unix.SYS_WRITE, uintptr(unix.Stderr), uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
+	unix.RawSyscall(unix.SYS_WRITE, uintptr(unix.Stderr), uintptr(unsafe.Pointer(&str)), 18)
 }
 
 // bluepillHandler is called from the signal stub.
@@ -102,7 +116,7 @@ func bluepillHandler(context unsafe.Pointer) {
 	c := bluepillArchEnter(bluepillArchContext(context))
 
 	// Mark this as guest mode.
-	switch atomic.SwapUint32(&c.state, vCPUGuest|vCPUUser) {
+	switch c.state.Swap(vCPUGuest | vCPUUser) {
 	case vCPUUser: // Expected case.
 	case vCPUUser | vCPUWaiter:
 		c.notify()
@@ -111,10 +125,12 @@ func bluepillHandler(context unsafe.Pointer) {
 	}
 
 	for {
+		hostExitCounter.Increment()
 		_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(c.fd), _KVM_RUN, 0) // escapes: no.
 		switch errno {
 		case 0: // Expected case.
 		case unix.EINTR:
+			interruptCounter.Increment()
 			// First, we process whatever pending signal
 			// interrupted KVM. Since we're in a signal handler
 			// currently, all signals are masked and the signal
@@ -184,6 +200,7 @@ func bluepillHandler(context unsafe.Pointer) {
 			c.die(bluepillArchContext(context), "debug")
 			return
 		case _KVM_EXIT_HLT:
+			c.hltSanityCheck()
 			bluepillGuestExit(c, context)
 			return
 		case _KVM_EXIT_MMIO:

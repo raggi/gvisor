@@ -21,13 +21,14 @@ import (
 	mrand "math/rand"
 	"os"
 	"runtime"
-	"sync/atomic"
 	gtime "time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/cpuid"
@@ -36,21 +37,20 @@ import (
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/host"
-	"gvisor.dev/gvisor/pkg/sentry/fs/user"
-	hostvfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
-	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux/vfs2"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -72,8 +72,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	_ "gvisor.dev/gvisor/runsc/boot/platforms" // register all platforms.
+	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/specutils/seccomp"
 
@@ -100,8 +102,26 @@ type containerInfo struct {
 	// stdioFDs contains stdin, stdout, and stderr.
 	stdioFDs []*fd.FD
 
+	// passFDs are mappings of user-supplied host to guest file descriptors.
+	passFDs []fdMapping
+
+	// execFD is the host file descriptor used for program execution.
+	execFD *fd.FD
+
 	// goferFDs are the FDs that attach the sandbox to the gofers.
 	goferFDs []*fd.FD
+
+	// overlayFilestoreFDs are the FDs to the regular files that will back the
+	// tmpfs upper mount in the overlay mounts.
+	overlayFilestoreFDs []*fd.FD
+
+	// overlayMediums contains information about how the gofer mounts have been
+	// overlaid. The first entry is for rootfs and the following entries are for
+	// bind mounts in spec.Mounts (in the same order).
+	overlayMediums []OverlayMedium
+
+	// nvidiaUVMDevMajor is the device major number used for nvidia-uvm.
+	nvidiaUVMDevMajor uint32
 }
 
 // Loader keeps state needed to start the kernel and run the container.
@@ -125,29 +145,40 @@ type Loader struct {
 	// should be called when a sandbox is destroyed.
 	stopProfiling func()
 
+	// PreSeccompCallback is called right before installing seccomp filters.
+	PreSeccompCallback func()
+
 	// restore is set to true if we are restoring a container.
 	restore bool
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
 
-	// mu guards processes.
+	// mountHints provides extra information about mounts for containers that
+	// apply to the entire pod.
+	mountHints *PodMountHints
+
+	// productName is the value to show in
+	// /sys/devices/virtual/dmi/id/product_name.
+	productName string
+
+	// nvidiaUVMDevMajor is the device major number used for nvidia-uvm.
+	nvidiaUVMDevMajor uint32
+
+	// mu guards processes and porForwardProxies.
 	mu sync.Mutex
 
 	// processes maps containers init process and invocation of exec. Root
 	// processes are keyed with container ID and pid=0, while exec invocations
 	// have the corresponding pid set.
 	//
-	// processes is guardded by mu.
+	// processes is guarded by mu.
 	processes map[execID]*execProcess
 
-	// mountHints provides extra information about mounts for containers that
-	// apply to the entire pod.
-	mountHints *podMountHints
-
-	// productName is the value to show in
-	// /sys/devices/virtual/dmi/id/product_name.
-	productName string
+	// portForwardProxies is a list of active port forwarding connections.
+	//
+	// portForwardProxies is guarded by mu.
+	portForwardProxies []*pf.Proxy
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
@@ -162,10 +193,7 @@ type execProcess struct {
 	tg *kernel.ThreadGroup
 
 	// tty will be nil if the process is not attached to a terminal.
-	tty *host.TTYFileOperations
-
-	// tty will be nil if the process is not attached to a terminal.
-	ttyVFS2 *hostvfs2.TTYFileDescription
+	tty *host.TTYFileDescription
 
 	// pidnsPath is the pid namespace path in spec
 	pidnsPath string
@@ -174,6 +202,21 @@ type execProcess struct {
 	// TTY file is passed during container create and must be saved until
 	// container start.
 	hostTTY *fd.FD
+}
+
+// fdMapping maps guest to host file descriptors. Guest file descriptors are
+// exposed to the application inside the sandbox through the FD table.
+type fdMapping struct {
+	guest int
+	host  *fd.FD
+}
+
+// FDMapping is a helper type to represent a mapping from guest to host file
+// descriptors. In contrast to the unexported fdMapping type, it does not imply
+// file ownership.
+type FDMapping struct {
+	Guest int
+	Host  int
 }
 
 func init() {
@@ -201,31 +244,39 @@ type Args struct {
 	// StdioFDs is the stdio for the application. The Loader takes ownership of
 	// these FDs and may close them at any time.
 	StdioFDs []int
+	// PassFDs are user-supplied FD mappings from host to guest descriptors.
+	// The Loader takes ownership of these FDs and may close them at any time.
+	PassFDs []FDMapping
+	// ExecFD is the host file descriptor used for program execution.
+	ExecFD int
+	// OverlayFilestoreFDs are the FDs to the regular files that will back the
+	// tmpfs upper mount in the overlay mounts.
+	OverlayFilestoreFDs []int
+	// OverlayMediums contains information about how the gofer mounts have been
+	// overlaid. The first entry is for rootfs and the following entries are for
+	// bind mounts in Spec.Mounts (in the same order).
+	OverlayMediums []OverlayMedium
 	// NumCPU is the number of CPUs to create inside the sandbox.
 	NumCPU int
 	// TotalMem is the initial amount of total memory to report back to the
 	// container.
 	TotalMem uint64
+	// TotalHostMem is the total memory reported by host /proc/meminfo.
+	TotalHostMem uint64
 	// UserLogFD is the file descriptor to write user logs to.
 	UserLogFD int
-	// ProfileBlockFD is the file descriptor to write a block profile to.
-	// Valid if >=0.
-	ProfileBlockFD int
-	// ProfileCPUFD is the file descriptor to write a CPU profile to.
-	// Valid if >=0.
-	ProfileCPUFD int
-	// ProfileHeapFD is the file descriptor to write a heap profile to.
-	// Valid if >=0.
-	ProfileHeapFD int
-	// ProfileMutexFD is the file descriptor to write a mutex profile to.
-	// Valid if >=0.
-	ProfileMutexFD int
-	// TraceFD is the file descriptor to write a Go execution trace to.
-	// Valid if >=0.
-	TraceFD int
 	// ProductName is the value to show in
 	// /sys/devices/virtual/dmi/id/product_name.
 	ProductName string
+	// PodInitConfigFD is the file descriptor to a file passed in the
+	//	--pod-init-config flag
+	PodInitConfigFD int
+	// SinkFDs is an ordered array of file descriptors to be used by seccheck
+	// sinks configured from the --pod-init-config file.
+	SinkFDs []int
+	// ProfileOpts contains the set of profiles to enable and the
+	// corresponding FDs where profile data will be written.
+	ProfileOpts profile.Opts
 }
 
 // make sure stdioFDs are always the same on initial start and on restore
@@ -234,7 +285,10 @@ const startingStdioFD = 256
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
-	stopProfiling := startProfiling(args)
+	stopProfiling := profile.Start(args.ProfileOpts)
+
+	// Initialize seccheck points.
+	seccheck.Initialize()
 
 	// We initialize the rand package now to make sure /dev/urandom is pre-opened
 	// on kernels that do not support getrandom(2).
@@ -246,18 +300,17 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("setting up memory usage: %w", err)
 	}
 
-	// Is this a VFSv2 kernel?
-	if args.Conf.VFS2 {
-		kernel.VFS2Enabled = true
-		kernel.FUSEEnabled = args.Conf.FUSE
-		kernel.LISAFSEnabled = args.Conf.Lisafs
-		vfs2.Override()
+	kernel.IOUringEnabled = args.Conf.IOUring
+
+	info := containerInfo{
+		conf:           args.Conf,
+		spec:           args.Spec,
+		overlayMediums: args.OverlayMediums,
 	}
 
 	// Make host FDs stable between invocations. Host FDs must map to the exact
 	// same number when the sandbox is restored. Otherwise the wrong FD will be
 	// used.
-	info := containerInfo{}
 	newfd := startingStdioFD
 
 	for _, stdioFD := range args.StdioFDs {
@@ -280,11 +333,28 @@ func New(args Args) (*Loader, error) {
 	for _, goferFD := range args.GoferFDs {
 		info.goferFDs = append(info.goferFDs, fd.New(goferFD))
 	}
+	for _, overlayFD := range args.OverlayFilestoreFDs {
+		info.overlayFilestoreFDs = append(info.overlayFilestoreFDs, fd.New(overlayFD))
+	}
+
+	if args.ExecFD >= 0 {
+		info.execFD = fd.New(args.ExecFD)
+	}
+
+	for _, customFD := range args.PassFDs {
+		info.passFDs = append(info.passFDs, fdMapping{
+			host:  fd.New(customFD.Host),
+			guest: customFD.Guest,
+		})
+	}
 
 	// Create kernel and platform.
 	p, err := createPlatform(args.Conf, args.Device)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
+	}
+	if args.Conf.NVProxy && p.OwnsPageTables() {
+		return nil, fmt.Errorf("--nvproxy is incompatible with platform %s: owns page tables", args.Conf.Platform)
 	}
 	k := &kernel.Kernel{
 		Platform: p,
@@ -345,6 +415,12 @@ func New(args Args) (*Loader, error) {
 	log.Infof("CPUs: %d", args.NumCPU)
 	runtime.GOMAXPROCS(args.NumCPU)
 
+	if args.TotalHostMem > 0 {
+		// As per tmpfs(5), the default size limit is 50% of total physical RAM.
+		// See mm/shmem.c:shmem_default_max_blocks().
+		tmpfs.SetDefaultSizeLimit(args.TotalHostMem / 2)
+	}
+
 	if args.TotalMem > 0 {
 		// Adjust the total memory returned by the Sentry so that applications that
 		// use /proc/meminfo can make allocations based on this limit.
@@ -370,23 +446,17 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
-	if kernel.VFS2Enabled {
-		if err := registerFilesystems(k); err != nil {
-			return nil, fmt.Errorf("registering filesystems: %w", err)
-		}
-	}
-
-	if err := adjustDirentCache(k); err != nil {
-		return nil, err
+	if err := registerFilesystems(k, &info); err != nil {
+		return nil, fmt.Errorf("registering filesystems: %w", err)
 	}
 
 	// Turn on packet logging if enabled.
 	if args.Conf.LogPackets {
 		log.Infof("Packet logging enabled")
-		atomic.StoreUint32(&sniffer.LogPackets, 1)
+		sniffer.LogPackets.Store(1)
 	} else {
 		log.Infof("Packet logging disabled")
-		atomic.StoreUint32(&sniffer.LogPackets, 0)
+		sniffer.LogPackets.Store(0)
 	}
 
 	// Create a watchdog.
@@ -404,34 +474,36 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing compat logs: %w", err)
 	}
 
-	mountHints, err := newPodMountHints(args.Spec)
+	mountHints, err := NewPodMountHints(args.Spec)
 	if err != nil {
 		return nil, fmt.Errorf("creating pod mount hints: %w", err)
 	}
 
-	info.conf = args.Conf
-	info.spec = args.Spec
+	// Set up host mount that will be used for imported fds.
+	hostFilesystem, err := host.NewFilesystem(k.VFS())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hostfs filesystem: %w", err)
+	}
+	defer hostFilesystem.DecRef(k.SupervisorContext())
+	k.SetHostMount(k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{}))
 
-	if kernel.VFS2Enabled {
-		// Set up host mount that will be used for imported fds.
-		hostFilesystem, err := hostvfs2.NewFilesystem(k.VFS())
-		if err != nil {
-			return nil, fmt.Errorf("failed to create hostfs filesystem: %w", err)
+	if args.PodInitConfigFD >= 0 {
+		if err := setupSeccheck(args.PodInitConfigFD, args.SinkFDs); err != nil {
+			log.Warningf("unable to configure event session: %v", err)
 		}
-		defer hostFilesystem.DecRef(k.SupervisorContext())
-		k.SetHostMount(k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{}))
 	}
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		k:             k,
-		watchdog:      dog,
-		sandboxID:     args.ID,
-		processes:     map[execID]*execProcess{eid: {}},
-		mountHints:    mountHints,
-		root:          info,
-		stopProfiling: stopProfiling,
-		productName:   args.ProductName,
+		k:                 k,
+		watchdog:          dog,
+		sandboxID:         args.ID,
+		processes:         map[execID]*execProcess{eid: {}},
+		mountHints:        mountHints,
+		root:              info,
+		stopProfiling:     stopProfiling,
+		productName:       args.ProductName,
+		nvidiaUVMDevMajor: info.nvidiaUVMDevMajor,
 	}
 
 	// We don't care about child signals; some platforms can generate a
@@ -515,11 +587,17 @@ func (l *Loader) Destroy() {
 	// save/restore.
 	l.k.Release()
 
+	// Release any dangling tcp connections.
+	tcpip.ReleaseDanglingEndpoints()
+
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
 	// gofer sessions. Close them here in case of failure.
 	for _, f := range l.root.stdioFDs {
 		_ = f.Close()
+	}
+	for _, f := range l.root.passFDs {
+		_ = f.host.Close()
 	}
 	for _, f := range l.root.goferFDs {
 		_ = f.Close()
@@ -557,14 +635,22 @@ func createMemoryFile() (*pgalloc.MemoryFile, error) {
 
 // installSeccompFilters installs sandbox seccomp filters with the host.
 func (l *Loader) installSeccompFilters() error {
+	if l.PreSeccompCallback != nil {
+		l.PreSeccompCallback()
+	}
 	if l.root.conf.DisableSeccomp {
 		filter.Report("syscall filter is DISABLED. Running in less secure mode.")
 	} else {
+		hostnet := l.root.conf.Network == config.NetworkHost
 		opts := filter.Options{
-			Platform:      l.k.Platform,
-			HostNetwork:   l.root.conf.Network == config.NetworkHost,
-			ProfileEnable: l.root.conf.ProfileEnable,
-			ControllerFD:  l.ctrl.srv.FD(),
+			Platform:              l.k.Platform,
+			HostNetwork:           hostnet,
+			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
+			HostFilesystem:        l.root.conf.DirectFS,
+			ProfileEnable:         l.root.conf.ProfileEnable,
+			NVProxy:               l.root.conf.NVProxy,
+			TPUProxy:              l.root.conf.TPUProxy,
+			ControllerFD:          l.ctrl.srv.FD(),
 		}
 		if err := filter.Install(opts); err != nil {
 			return fmt.Errorf("installing seccomp filters: %w", err)
@@ -594,7 +680,7 @@ func (l *Loader) run() error {
 		// is configured after the loader is created and before Run() is called.
 		log.Debugf("Configuring host network")
 		s := l.k.RootNetworkNamespace().Stack().(*hostinet.Stack)
-		if err := s.Configure(); err != nil {
+		if err := s.Configure(l.root.conf.EnableRaw); err != nil {
 			return err
 		}
 	}
@@ -623,10 +709,33 @@ func (l *Loader) run() error {
 
 		// Create the root container init task. It will begin running
 		// when the kernel is started.
-		var err error
-		_, ep.tty, ep.ttyVFS2, err = l.createContainerProcess(true, l.sandboxID, &l.root)
+		var (
+			tg  *kernel.ThreadGroup
+			err error
+		)
+		tg, ep.tty, err = l.createContainerProcess(true, l.sandboxID, &l.root)
 		if err != nil {
 			return err
+		}
+
+		if seccheck.Global.Enabled(seccheck.PointContainerStart) {
+			evt := pb.Start{
+				Id:       l.sandboxID,
+				Cwd:      l.root.spec.Process.Cwd,
+				Args:     l.root.spec.Process.Args,
+				Terminal: l.root.spec.Process.Terminal,
+			}
+			fields := seccheck.Global.GetFieldSet(seccheck.PointContainerStart)
+			if fields.Local.Contains(seccheck.FieldContainerStartEnv) {
+				evt.Env = l.root.spec.Process.Env
+			}
+			if !fields.Context.Empty() {
+				evt.ContextData = &pb.ContextData{}
+				kernel.LoadSeccheckData(tg.Leader(), fields.Context, evt.ContextData)
+			}
+			_ = seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+				return c.ContainerStart(context.Background(), fields, &evt)
+			})
 		}
 	}
 
@@ -678,7 +787,7 @@ func (l *Loader) createSubcontainer(cid string, tty *fd.FD) error {
 // startSubcontainer starts a child container. It returns the thread group ID of
 // the newly created process. Used FDs are either closed or released. It's safe
 // for the caller to close any remaining files upon return.
-func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdioFDs, goferFDs []*fd.FD) error {
+func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdioFDs, goferFDs, overlayFilestoreFDs []*fd.FD, overlayMediums []OverlayMedium) error {
 	// Create capabilities.
 	caps, err := specutils.Capabilities(conf.EnableRaw, spec.Process.Capabilities)
 	if err != nil {
@@ -715,12 +824,14 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		if ns.Path != "" {
 			for _, p := range l.processes {
 				if ns.Path == p.pidnsPath {
+					log.Debugf("Joining PID namespace named %q", ns.Path)
 					pidns = p.tg.PIDNamespace()
 					break
 				}
 			}
 		}
 		if pidns == nil {
+			log.Warningf("PID namespace %q not found, running in new PID namespace", ns.Path)
 			pidns = l.k.RootPIDNamespace().NewChild(l.k.RootUserNamespace())
 		}
 		ep.pidnsPath = ns.Path
@@ -729,9 +840,12 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	}
 
 	info := &containerInfo{
-		conf:     conf,
-		spec:     spec,
-		goferFDs: goferFDs,
+		conf:                conf,
+		spec:                spec,
+		goferFDs:            goferFDs,
+		overlayFilestoreFDs: overlayFilestoreFDs,
+		overlayMediums:      overlayMediums,
+		nvidiaUVMDevMajor:   l.nvidiaUVMDevMajor,
 	}
 	info.procArgs, err = createProcessArgs(cid, spec, creds, l.k, pidns)
 	if err != nil {
@@ -752,70 +866,100 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		info.stdioFDs = stdioFDs
 	}
 
-	ep.tg, ep.tty, ep.ttyVFS2, err = l.createContainerProcess(false, cid, info)
+	ep.tg, ep.tty, err = l.createContainerProcess(false, cid, info)
 	if err != nil {
 		return err
 	}
+
+	if seccheck.Global.Enabled(seccheck.PointContainerStart) {
+		evt := pb.Start{
+			Id:       cid,
+			Cwd:      spec.Process.Cwd,
+			Args:     spec.Process.Args,
+			Terminal: spec.Process.Terminal,
+		}
+		fields := seccheck.Global.GetFieldSet(seccheck.PointContainerStart)
+		if fields.Local.Contains(seccheck.FieldContainerStartEnv) {
+			evt.Env = spec.Process.Env
+		}
+		if !fields.Context.Empty() {
+			evt.ContextData = &pb.ContextData{}
+			kernel.LoadSeccheckData(ep.tg.Leader(), fields.Context, evt.ContextData)
+		}
+		_ = seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.ContainerStart(context.Background(), fields, &evt)
+		})
+	}
+
 	l.k.StartProcess(ep.tg)
 	return nil
 }
 
-func (l *Loader) createContainerProcess(root bool, cid string, info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func (l *Loader) createContainerProcess(root bool, cid string, info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
-	fdTable, ttyFile, ttyFileVFS2, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.spec.Process.User)
+	fdTable, ttyFile, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("importing fds: %w", err)
+		return nil, nil, fmt.Errorf("importing fds: %w", err)
 	}
 	// CreateProcess takes a reference on fdTable if successful. We won't need
 	// ours either way.
 	info.procArgs.FDTable = fdTable
 
+	if info.execFD != nil {
+		if info.procArgs.Filename != "" {
+			return nil, nil, fmt.Errorf("process must either be started from a file or a filename, not both")
+		}
+		file, err := host.NewFD(ctx, l.k.HostMount(), info.execFD.FD(), &host.NewFDOptions{
+			Readonly:     true,
+			Savable:      true,
+			VirtualOwner: true,
+			UID:          auth.KUID(info.spec.Process.User.UID),
+			GID:          auth.KGID(info.spec.Process.User.GID),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		defer file.DecRef(ctx)
+		info.execFD.Release()
+
+		info.procArgs.File = file
+	}
+
 	// Gofer FDs must be ordered and the first FD is always the rootfs.
 	if len(info.goferFDs) < 1 {
-		return nil, nil, nil, fmt.Errorf("rootfs gofer FD not found")
+		return nil, nil, fmt.Errorf("rootfs gofer FD not found")
 	}
 	l.startGoferMonitor(cid, int32(info.goferFDs[0].FD()))
 
-	mntr := newContainerMounter(info, l.k, l.mountHints, kernel.VFS2Enabled, l.productName)
+	mntr := newContainerMounter(info, l.k, l.mountHints, l.productName, l.sandboxID)
 	if root {
 		if err := mntr.processHints(info.conf, info.procArgs.Credentials); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	}
-	if err := setupContainerFS(ctx, info.conf, mntr, &info.procArgs); err != nil {
-		return nil, nil, nil, err
+	if err := setupContainerVFS(ctx, info, mntr, &info.procArgs); err != nil {
+		return nil, nil, err
 	}
 
 	// Add the HOME environment variable if it is not already set.
-	var envv []string
-	if kernel.VFS2Enabled {
-		envv, err = user.MaybeAddExecUserHomeVFS2(ctx, info.procArgs.MountNamespaceVFS2,
-			info.procArgs.Credentials.RealKUID, info.procArgs.Envv)
-
-	} else {
-		envv, err = user.MaybeAddExecUserHome(ctx, info.procArgs.MountNamespace,
-			info.procArgs.Credentials.RealKUID, info.procArgs.Envv)
-	}
+	info.procArgs.Envv, err = user.MaybeAddExecUserHome(ctx, info.procArgs.MountNamespace,
+		info.procArgs.Credentials.RealKUID, info.procArgs.Envv)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	info.procArgs.Envv = envv
 
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(info.procArgs)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("creating process: %w", err)
+		return nil, nil, fmt.Errorf("creating process: %w", err)
 	}
 	// CreateProcess takes a reference on FDTable if successful.
 	info.procArgs.FDTable.DecRef(ctx)
 
 	// Set the foreground process group on the TTY to the global init process
 	// group, since that is what we are about to start running.
-	switch {
-	case ttyFileVFS2 != nil:
-		ttyFileVFS2.InitForegroundProcessGroup(tg.ProcessGroup())
-	case ttyFile != nil:
+	if ttyFile != nil {
 		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
 	}
 
@@ -824,7 +968,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 		if info.spec.Linux != nil && info.spec.Linux.Seccomp != nil {
 			program, err := seccomp.BuildProgram(info.spec.Linux.Seccomp)
 			if err != nil {
-				return nil, nil, nil, fmt.Errorf("building seccomp program: %w", err)
+				return nil, nil, fmt.Errorf("building seccomp program: %w", err)
 			}
 
 			if log.IsLogging(log.Debug) {
@@ -835,7 +979,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 			task := tg.Leader()
 			// NOTE: It seems Flags are ignored by runc so we ignore them too.
 			if err := task.AppendSyscallFilter(program, true); err != nil {
-				return nil, nil, nil, fmt.Errorf("appending seccomp filters: %w", err)
+				return nil, nil, fmt.Errorf("appending seccomp filters: %w", err)
 			}
 		}
 	} else {
@@ -844,7 +988,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 		}
 	}
 
-	return tg, ttyFile, ttyFileVFS2, nil
+	return tg, ttyFile, nil
 }
 
 // startGoferMonitor runs a goroutine to monitor gofer's health. It polls on
@@ -911,17 +1055,6 @@ func (l *Loader) destroySubcontainer(cid string) error {
 				t.ThreadGroup().WaitExited()
 			}
 		}
-
-		// At this point, all processes inside of the container have exited,
-		// releasing all references to the container's MountNamespace and
-		// causing all submounts and overlays to be unmounted.
-		//
-		// Since the container's MountNamespace has been released,
-		// MountNamespace.destroy() will have executed, but that function may
-		// trigger async close operations. We must wait for those to complete
-		// before returning, otherwise the caller may kill the gofer before
-		// they complete, causing a cascade of failing RPCs.
-		fs.AsyncBarrier()
 	}
 
 	// No more failure from this point on. Remove all container thread groups
@@ -952,22 +1085,10 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 
 	// Get the container MountNamespace from the Task. Try to acquire ref may fail
 	// in case it raced with task exit.
-	if kernel.VFS2Enabled {
-		// task.MountNamespaceVFS2() does not take a ref, so we must do so ourselves.
-		args.MountNamespaceVFS2 = tg.Leader().MountNamespaceVFS2()
-		if args.MountNamespaceVFS2 == nil || !args.MountNamespaceVFS2.TryIncRef() {
-			return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
-		}
-	} else {
-		var reffed bool
-		tg.Leader().WithMuLocked(func(t *kernel.Task) {
-			// task.MountNamespace() does not take a ref, so we must do so ourselves.
-			args.MountNamespace = t.MountNamespace()
-			reffed = args.MountNamespace.TryIncRef()
-		})
-		if !reffed {
-			return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
-		}
+	// task.MountNamespace() does not take a ref, so we must do so ourselves.
+	args.MountNamespace = tg.Leader().MountNamespace()
+	if args.MountNamespace == nil || !args.MountNamespace.TryIncRef() {
+		return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
 	}
 
 	args.Envv, err = specutils.ResolveEnvs(args.Envv)
@@ -976,25 +1097,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 
 	// Add the HOME environment variable if it is not already set.
-	if kernel.VFS2Enabled {
-		root := args.MountNamespaceVFS2.Root()
-		ctx := vfs.WithRoot(l.k.SupervisorContext(), root)
-		defer args.MountNamespaceVFS2.DecRef(ctx)
-		envv, err := user.MaybeAddExecUserHomeVFS2(ctx, args.MountNamespaceVFS2, args.KUID, args.Envv)
-		if err != nil {
-			return 0, err
-		}
-		args.Envv = envv
-	} else {
-		root := args.MountNamespace.Root()
-		ctx := fs.WithRoot(l.k.SupervisorContext(), root)
-		defer args.MountNamespace.DecRef(ctx)
-		defer root.DecRef(ctx)
-		envv, err := user.MaybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
-		if err != nil {
-			return 0, err
-		}
-		args.Envv = envv
+	ctx := vfs.WithRoot(l.k.SupervisorContext(), args.MountNamespace.Root())
+	defer args.MountNamespace.DecRef(ctx)
+	args.Envv, err = user.MaybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
+	if err != nil {
+		return 0, err
 	}
 	args.PIDNamespace = tg.PIDNamespace()
 
@@ -1005,16 +1112,15 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
-	newTG, tgid, ttyFile, ttyFileVFS2, err := control.ExecAsync(&proc, args)
+	newTG, tgid, ttyFile, err := control.ExecAsync(&proc, args)
 	if err != nil {
 		return 0, err
 	}
 
 	eid := execID{cid: args.ContainerID, pid: tgid}
 	l.processes[eid] = &execProcess{
-		tg:      newTG,
-		tty:     ttyFile,
-		ttyVFS2: ttyFileVFS2,
+		tg:  newTG,
+		tty: ttyFile,
 	}
 	log.Debugf("updated processes: %v", l.processes)
 
@@ -1040,7 +1146,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	// sandbox is killed by a signal after the ContMgrWait request is completed.
 	if l.root.procArgs.ContainerID == cid {
 		// All sentry-created resources should have been released at this point.
-		refsvfs2.DoLeakCheck()
+		refs.DoLeakCheck()
 		_ = coverage.Report()
 	}
 	return nil
@@ -1113,6 +1219,12 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 	// Run().
 	switch conf.Network {
 	case config.NetworkHost:
+		// If configured for raw socket support with host network
+		// stack, make sure that we have CAP_NET_RAW the host,
+		// otherwise we can't make raw sockets.
+		if conf.EnableRaw && !specutils.HasCapabilities(capability.CAP_NET_RAW) {
+			return nil, fmt.Errorf("configuring network=host with raw sockets requires CAP_NET_RAW capability")
+		}
 		// No network namespacing support for hostinet yet, hence creator is nil.
 		return inet.NewRootNamespace(hostinet.NewStack(), nil), nil
 
@@ -1293,21 +1405,15 @@ func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, s
 		return fmt.Errorf("container %q not started", cid)
 	}
 
-	tty, ttyVFS2, err := l.ttyFromIDLocked(execID{cid: cid, pid: tgid})
+	tty, err := l.ttyFromIDLocked(execID{cid: cid, pid: tgid})
 	l.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("no thread group found: %w", err)
 	}
-
-	var pg *kernel.ProcessGroup
-	switch {
-	case ttyVFS2 != nil:
-		pg = ttyVFS2.ForegroundProcessGroup()
-	case tty != nil:
-		pg = tty.ForegroundProcessGroup()
-	default:
+	if tty == nil {
 		return fmt.Errorf("no TTY attached")
 	}
+	pg := tty.ForegroundProcessGroup()
 	if pg == nil {
 		// No foreground process group has been set. Signal the
 		// original thread group.
@@ -1370,25 +1476,135 @@ func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, er
 // return nil in case the container has not started yet. Returns error if
 // execution ID is invalid or if the container cannot be found (maybe it has
 // been deleted). Caller must hold 'mu'.
-func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileDescription, error) {
 	ep := l.processes[key]
 	if ep == nil {
-		return nil, nil, fmt.Errorf("container %q not found", key.cid)
+		return nil, fmt.Errorf("container %q not found", key.cid)
 	}
-	return ep.tty, ep.ttyVFS2, nil
+	return ep.tty, nil
 }
 
-func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD, user specs.User) (*kernel.FDTable, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD, passFDs []fdMapping, user specs.User) (*kernel.FDTable, *host.TTYFileDescription, error) {
 	if len(stdioFDs) != 3 {
-		return nil, nil, nil, fmt.Errorf("stdioFDs should contain exactly 3 FDs (stdin, stdout, and stderr), but %d FDs received", len(stdioFDs))
+		return nil, nil, fmt.Errorf("stdioFDs should contain exactly 3 FDs (stdin, stdout, and stderr), but %d FDs received", len(stdioFDs))
+	}
+	fdMap := map[int]*fd.FD{
+		0: stdioFDs[0],
+		1: stdioFDs[1],
+		2: stdioFDs[2],
+	}
+
+	// Create the entries for the host files that were passed to our app.
+	for _, customFD := range passFDs {
+		if customFD.guest < 0 {
+			return nil, nil, fmt.Errorf("guest file descriptors must be 0 or greater")
+		}
+		fdMap[customFD.guest] = customFD.host
 	}
 
 	k := kernel.KernelFromContext(ctx)
 	fdTable := k.NewFDTable()
-	ttyFile, ttyFileVFS2, err := fdimport.Import(ctx, fdTable, console, auth.KUID(user.UID), auth.KGID(user.GID), stdioFDs)
+	ttyFile, err := fdimport.Import(ctx, fdTable, console, auth.KUID(user.UID), auth.KGID(user.GID), fdMap)
 	if err != nil {
 		fdTable.DecRef(ctx)
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return fdTable, ttyFile, ttyFileVFS2, nil
+	return fdTable, ttyFile, nil
+}
+
+// portForward implements initiating a portForward connection in the sandbox. portForwardProxies
+// represent a two connections each copying to each other (read ends to write ends) in goroutines.
+// The proxies are stored and can be cleaned up, or clean up after themselves if the connection
+// is broken.
+func (l *Loader) portForward(opts *PortForwardOpts) error {
+	// Validate that we have a stream FD to write to. If this happens then
+	// it means there is a misbehaved urpc client or a bug has occurred.
+	if len(opts.Files) != 1 {
+		return fmt.Errorf("stream FD is required for port forward")
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cid := opts.ContainerID
+	tg, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
+	if err != nil {
+		return fmt.Errorf("failed to get threadgroup from %q: %w", cid, err)
+	}
+	if tg == nil {
+		return fmt.Errorf("container %q not started", cid)
+	}
+
+	// Import the fd for the UDS.
+	ctx := l.k.SupervisorContext()
+	fd, err := l.importFD(ctx, opts.Files[0])
+	if err != nil {
+		return fmt.Errorf("importing stream fd: %w", err)
+	}
+	cu := cleanup.Make(func() { fd.DecRef(ctx) })
+	defer cu.Clean()
+
+	fdConn := pf.NewFileDescriptionConn(fd)
+
+	// Create a proxy to forward data between the fdConn and the sandboxed application.
+	pair := pf.ProxyPair{To: fdConn}
+
+	switch l.root.conf.Network {
+	case config.NetworkSandbox:
+		stack := l.k.RootNetworkNamespace().Stack().(*netstack.Stack).Stack
+		nsConn, err := pf.NewNetstackConn(stack, opts.Port)
+		if err != nil {
+			return fmt.Errorf("creating netstack port forward connection: %w", err)
+		}
+		pair.From = nsConn
+	case config.NetworkHost:
+		hConn, err := pf.NewHostInetConn(opts.Port)
+		if err != nil {
+			return fmt.Errorf("creating hostinet port forward connection: %w", err)
+		}
+		pair.From = hConn
+	default:
+		return fmt.Errorf("unsupported network type %q for container %q", l.root.conf.Network, cid)
+	}
+	cu.Release()
+	proxy := pf.NewProxy(pair, opts.ContainerID)
+
+	// Add to the list of port forward connections and remove when the
+	// connection closes.
+	l.portForwardProxies = append(l.portForwardProxies, proxy)
+	proxy.AddCleanup(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for i := range l.portForwardProxies {
+			if l.portForwardProxies[i] == proxy {
+				l.portForwardProxies = append(l.portForwardProxies[:i], l.portForwardProxies[i+1:]...)
+				break
+			}
+		}
+	})
+
+	// Start forwarding on the connection.
+	proxy.Start(ctx)
+	return nil
+}
+
+// importFD generically imports a host file descriptor without adding it to any
+// fd table.
+func (l *Loader) importFD(ctx context.Context, f *os.File) (*vfs.FileDescription, error) {
+	hostFD, err := fd.NewFromFile(f)
+	if err != nil {
+		return nil, err
+	}
+	defer hostFD.Close()
+	fd, err := host.NewFD(ctx, l.k.HostMount(), hostFD.FD(), &host.NewFDOptions{
+		Savable:      false, // We disconnect and close on save.
+		IsTTY:        false,
+		VirtualOwner: false, // FD not visible to the sandboxed app so user can't be changed.
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	hostFD.Release()
+	return fd, nil
 }

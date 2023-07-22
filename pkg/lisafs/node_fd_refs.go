@@ -2,9 +2,9 @@ package lisafs
 
 import (
 	"fmt"
-	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/refs"
 )
 
 // enableLogging indicates whether reference-related events should be logged (with
@@ -37,27 +37,28 @@ type nodeRefs struct {
 	// Speculative references are used for TryIncRef, to avoid a CompareAndSwap
 	// loop. See IncRef, DecRef and TryIncRef for details of how these fields are
 	// used.
-	refCount int64
+	refCount atomicbitops.Int64
 }
 
 // InitRefs initializes r with one reference and, if enabled, activates leak
 // checking.
 func (r *nodeRefs) InitRefs() {
-	atomic.StoreInt64(&r.refCount, 1)
-	refsvfs2.Register(r)
+
+	r.refCount.RacyStore(1)
+	refs.Register(r)
 }
 
-// RefType implements refsvfs2.CheckedObject.RefType.
+// RefType implements refs.CheckedObject.RefType.
 func (r *nodeRefs) RefType() string {
 	return fmt.Sprintf("%T", nodeobj)[1:]
 }
 
-// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+// LeakMessage implements refs.CheckedObject.LeakMessage.
 func (r *nodeRefs) LeakMessage() string {
 	return fmt.Sprintf("[%s %p] reference count of %d instead of 0", r.RefType(), r, r.ReadRefs())
 }
 
-// LogRefs implements refsvfs2.CheckedObject.LogRefs.
+// LogRefs implements refs.CheckedObject.LogRefs.
 func (r *nodeRefs) LogRefs() bool {
 	return nodeenableLogging
 }
@@ -65,16 +66,16 @@ func (r *nodeRefs) LogRefs() bool {
 // ReadRefs returns the current number of references. The returned count is
 // inherently racy and is unsafe to use without external synchronization.
 func (r *nodeRefs) ReadRefs() int64 {
-	return atomic.LoadInt64(&r.refCount)
+	return r.refCount.Load()
 }
 
 // IncRef implements refs.RefCounter.IncRef.
 //
 //go:nosplit
 func (r *nodeRefs) IncRef() {
-	v := atomic.AddInt64(&r.refCount, 1)
+	v := r.refCount.Add(1)
 	if nodeenableLogging {
-		refsvfs2.LogIncRef(r, v)
+		refs.LogIncRef(r, v)
 	}
 	if v <= 1 {
 		panic(fmt.Sprintf("Incrementing non-positive count %p on %s", r, r.RefType()))
@@ -90,15 +91,15 @@ func (r *nodeRefs) IncRef() {
 //go:nosplit
 func (r *nodeRefs) TryIncRef() bool {
 	const speculativeRef = 1 << 32
-	if v := atomic.AddInt64(&r.refCount, speculativeRef); int32(v) == 0 {
+	if v := r.refCount.Add(speculativeRef); int32(v) == 0 {
 
-		atomic.AddInt64(&r.refCount, -speculativeRef)
+		r.refCount.Add(-speculativeRef)
 		return false
 	}
 
-	v := atomic.AddInt64(&r.refCount, -speculativeRef+1)
+	v := r.refCount.Add(-speculativeRef + 1)
 	if nodeenableLogging {
-		refsvfs2.LogTryIncRef(r, v)
+		refs.LogTryIncRef(r, v)
 	}
 	return true
 }
@@ -116,16 +117,16 @@ func (r *nodeRefs) TryIncRef() bool {
 //
 //go:nosplit
 func (r *nodeRefs) DecRef(destroy func()) {
-	v := atomic.AddInt64(&r.refCount, -1)
+	v := r.refCount.Add(-1)
 	if nodeenableLogging {
-		refsvfs2.LogDecRef(r, v)
+		refs.LogDecRef(r, v)
 	}
 	switch {
 	case v < 0:
 		panic(fmt.Sprintf("Decrementing non-positive ref count %p, owned by %s", r, r.RefType()))
 
 	case v == 0:
-		refsvfs2.Unregister(r)
+		refs.Unregister(r)
 
 		if destroy != nil {
 			destroy()
@@ -135,6 +136,6 @@ func (r *nodeRefs) DecRef(destroy func()) {
 
 func (r *nodeRefs) afterLoad() {
 	if r.ReadRefs() > 0 {
-		refsvfs2.Register(r)
+		refs.Register(r)
 	}
 }

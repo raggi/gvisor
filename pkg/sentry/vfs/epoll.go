@@ -50,7 +50,7 @@ type EpollInstance struct {
 	// readyMu protects ready, readySeq, epollInterest.ready, and
 	// epollInterest.epollInterestEntry. ready is analogous to Linux's struct
 	// eventpoll::lock.
-	readyMu sync.Mutex `state:"nosave"`
+	readyMu epollReadyInstanceMutex `state:"nosave"`
 
 	// ready is the set of file descriptors that may be "ready" for I/O. Note
 	// that this must be an ordered list, not a map: "If more than maxevents
@@ -170,6 +170,7 @@ func (ep *EpollInstance) Readiness(mask waiter.EventMask) waiter.EventMask {
 		return 0
 	}
 	defer func() {
+		notify := false
 		ep.readyMu.Lock()
 		ep.ready.PushFrontList(&ready)
 		var next *epollInterest
@@ -179,11 +180,15 @@ func (ep *EpollInstance) Readiness(mask waiter.EventMask) waiter.EventMask {
 				// epi.NotifyEvent() was called while we were running.
 				notReady.Remove(epi)
 				ep.ready.PushBack(epi)
+				notify = true
 			} else {
 				epi.ready = false
 			}
 		}
 		ep.readyMu.Unlock()
+		if notify {
+			ep.q.Notify(waiter.ReadableEvents)
+		}
 	}()
 
 	var next *epollInterest
@@ -428,6 +433,7 @@ func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent, maxEvents int) []
 		return nil
 	}
 	defer func() {
+		notify := false
 		ep.readyMu.Lock()
 		// epollInterests that we never checked are re-inserted at the start of
 		// ep.ready. epollInterests that were ready are re-inserted at the end
@@ -440,12 +446,16 @@ func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent, maxEvents int) []
 				// epi.NotifyEvent() was called while we were running.
 				notReady.Remove(epi)
 				ep.ready.PushBack(epi)
+				notify = true
 			} else {
 				epi.ready = false
 			}
 		}
 		ep.ready.PushBackList(&requeue)
 		ep.readyMu.Unlock()
+		if notify {
+			ep.q.Notify(waiter.ReadableEvents)
+		}
 	}()
 
 	i := 0

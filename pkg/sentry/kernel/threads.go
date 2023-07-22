@@ -17,6 +17,7 @@ package kernel
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -45,11 +46,11 @@ func (tid ThreadID) String() string {
 	return fmt.Sprintf("%d", tid)
 }
 
-// InitTID is the TID given to the first task added to each PID namespace. The
-// thread group led by InitTID is called the namespace's init process. The
+// initTID is the TID given to the first task added to each PID namespace. The
+// thread group led by initTID is called the namespace's init process. The
 // death of a PID namespace's init process causes all tasks visible in that
 // namespace to be killed.
-const InitTID ThreadID = 1
+const initTID ThreadID = 1
 
 // A TaskSet comprises all tasks in a system.
 //
@@ -57,7 +58,7 @@ const InitTID ThreadID = 1
 type TaskSet struct {
 	// mu protects all relationships between tasks and thread groups in the
 	// TaskSet. (mu is approximately equivalent to Linux's tasklist_lock.)
-	mu sync.RWMutex `state:"nosave"`
+	mu taskSetRWMutex `state:"nosave"`
 
 	// Root is the root PID namespace, in which all tasks in the TaskSet are
 	// visible. The Root pointer is immutable.
@@ -148,6 +149,9 @@ type PIDNamespace struct {
 	// appropriate capabilities in userns. The userns pointer is immutable.
 	userns *auth.UserNamespace
 
+	// id is a unique ID assigned to the PID namespace. id is immutable.
+	id uint64
+
 	// The following fields are protected by owner.mu.
 
 	// last is the last ThreadID to be allocated in this namespace.
@@ -197,6 +201,7 @@ func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespa
 		owner:         ts,
 		parent:        parent,
 		userns:        userns,
+		id:            lastPIDNSID.Add(1),
 		tasks:         make(map[ThreadID]*Task),
 		tids:          make(map[*Task]ThreadID),
 		tgids:         make(map[*ThreadGroup]ThreadID),
@@ -207,6 +212,13 @@ func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespa
 		extra:         newPIDNamespaceData(),
 	}
 }
+
+// lastPIDNSID is the last value of PIDNamespace.ID assigned to a PID
+// namespace.
+//
+// This is global rather than being per-TaskSet or Kernel because
+// NewRootPIDNamespace() is called before the Kernel is initialized.
+var lastPIDNSID atomicbitops.Uint64
 
 // NewRootPIDNamespace creates the root PID namespace. 'owner' is not available
 // yet when root namespace is created and must be set by caller.
@@ -227,6 +239,11 @@ func (ns *PIDNamespace) TaskWithID(tid ThreadID) *Task {
 	t := ns.tasks[tid]
 	ns.owner.mu.RUnlock()
 	return t
+}
+
+// ID returns a non-zero ID that is unique across PID namespaces.
+func (ns *PIDNamespace) ID() uint64 {
+	return ns.id
 }
 
 // ThreadGroupWithID returns the thread group led by the task with thread ID
@@ -324,6 +341,11 @@ type threadGroupNode struct {
 	// pidns is the PID namespace containing the thread group and all of its
 	// member tasks. The pidns pointer is immutable.
 	pidns *PIDNamespace
+
+	// pidWithinNS the thread ID of the leader of this thread group within pidns.
+	// Useful to avoid using locks when determining a thread group leader's own
+	// TID.
+	pidWithinNS atomicbitops.Int32
 
 	// eventQueue is notified whenever a event of interest to Task.Wait occurs
 	// in a child of this thread group, or a ptrace tracee of a task in this
@@ -425,13 +447,10 @@ func (tg *ThreadGroup) MemberIDs(pidns *PIDNamespace) []ThreadID {
 	return tasks
 }
 
-// ID returns tg's leader's thread ID in its own PID namespace. If tg's leader
-// is dead, ID returns 0.
+// ID returns tg's leader's thread ID in its own PID namespace.
+// If tg's leader is dead, ID returns 0.
 func (tg *ThreadGroup) ID() ThreadID {
-	tg.pidns.owner.mu.RLock()
-	id := tg.pidns.tgids[tg]
-	tg.pidns.owner.mu.RUnlock()
-	return id
+	return ThreadID(tg.pidWithinNS.Load())
 }
 
 // A taskNode defines the relationship between a task and the rest of the
@@ -491,6 +510,14 @@ func (t *Task) Timekeeper() *Timekeeper {
 func (t *Task) Parent() *Task {
 	t.tg.pidns.owner.mu.RLock()
 	defer t.tg.pidns.owner.mu.RUnlock()
+	return t.parent
+}
+
+// ParentLocked returns t's parent. Caller must ensure t's TaskSet mu
+// is locked for at least reading.
+//
+// +checklocks:t.tg.pidns.owner.mu
+func (t *Task) ParentLocked() *Task {
 	return t.parent
 }
 

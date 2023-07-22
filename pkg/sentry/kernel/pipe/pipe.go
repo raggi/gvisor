@@ -18,30 +18,29 @@ package pipe
 import (
 	"fmt"
 	"io"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-const (
+var (
 	// MinimumPipeSize is a hard limit of the minimum size of a pipe.
 	// It corresponds to fs/pipe.c:pipe_min_size.
 	MinimumPipeSize = hostarch.PageSize
 
-	// MaximumPipeSize is a hard limit on the maximum size of a pipe.
-	// It corresponds to fs/pipe.c:pipe_max_size.
-	MaximumPipeSize = 1048576
-
 	// DefaultPipeSize is the system-wide default size of a pipe in bytes.
 	// It corresponds to pipe_fs_i.h:PIPE_DEF_BUFFERS.
 	DefaultPipeSize = 16 * hostarch.PageSize
+)
+
+const (
+	// MaximumPipeSize is a hard limit on the maximum size of a pipe.
+	// It corresponds to fs/pipe.c:pipe_max_size.
+	MaximumPipeSize = 1048576
 
 	// atomicIOBytes is the maximum number of bytes that the pipe will
 	// guarantee atomic reads or writes atomically.
@@ -120,27 +119,19 @@ type Pipe struct {
 	isNamed bool
 
 	// The number of active readers for this pipe.
-	//
-	// Access atomically.
-	readers int32
+	readers atomicbitops.Int32
 
 	// The total number of readers for this pipe.
-	//
-	// Access atomically.
-	totalReaders int32
+	totalReaders atomicbitops.Int32
 
 	// The number of active writers for this pipe.
-	//
-	// Access atomically.
-	writers int32
+	writers atomicbitops.Int32
 
 	// The total number of writers for this pipe.
-	//
-	// Access atomically.
-	totalWriters int32
+	totalWriters atomicbitops.Int32
 
 	// mu protects all pipe internal state below.
-	mu sync.Mutex `state:"nosave"`
+	mu pipeMutex `state:"nosave"`
 
 	// buf holds the pipe's data. buf is a circular buffer; the first valid
 	// byte in buf is at offset off, and the pipe contains size valid bytes.
@@ -180,68 +171,14 @@ func NewPipe(isNamed bool, sizeBytes int64) *Pipe {
 }
 
 func initPipe(pipe *Pipe, isNamed bool, sizeBytes int64) {
-	if sizeBytes < MinimumPipeSize {
-		sizeBytes = MinimumPipeSize
+	if sizeBytes < int64(MinimumPipeSize) {
+		sizeBytes = int64(MinimumPipeSize)
 	}
 	if sizeBytes > MaximumPipeSize {
 		sizeBytes = MaximumPipeSize
 	}
 	pipe.isNamed = isNamed
 	pipe.max = sizeBytes
-}
-
-// NewConnectedPipe initializes a pipe and returns a pair of objects
-// representing the read and write ends of the pipe.
-func NewConnectedPipe(ctx context.Context, sizeBytes int64) (*fs.File, *fs.File) {
-	p := NewPipe(false /* isNamed */, sizeBytes)
-
-	// Build an fs.Dirent for the pipe which will be shared by both
-	// returned files.
-	perms := fs.FilePermissions{
-		User: fs.PermMask{Read: true, Write: true},
-	}
-	iops := NewInodeOperations(ctx, perms, p)
-	ino := pipeDevice.NextIno()
-	sattr := fs.StableAttr{
-		Type:      fs.Pipe,
-		DeviceID:  pipeDevice.DeviceID(),
-		InodeID:   ino,
-		BlockSize: int64(atomicIOBytes),
-	}
-	ms := fs.NewPseudoMountSource(ctx)
-	d := fs.NewDirent(ctx, fs.NewInode(ctx, iops, ms, sattr), fmt.Sprintf("pipe:[%d]", ino))
-	// The p.Open calls below will each take a reference on the Dirent. We
-	// must drop the one we already have.
-	defer d.DecRef(ctx)
-	return p.Open(ctx, d, fs.FileFlags{Read: true}), p.Open(ctx, d, fs.FileFlags{Write: true})
-}
-
-// Open opens the pipe and returns a new file.
-//
-// Precondition: at least one of flags.Read or flags.Write must be set.
-func (p *Pipe) Open(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) *fs.File {
-	flags.NonSeekable = true
-	switch {
-	case flags.Read && flags.Write:
-		p.rOpen()
-		p.wOpen()
-		return fs.NewFile(ctx, d, flags, &ReaderWriter{
-			Pipe: p,
-		})
-	case flags.Read:
-		p.rOpen()
-		return fs.NewFile(ctx, d, flags, &Reader{
-			ReaderWriter: ReaderWriter{Pipe: p},
-		})
-	case flags.Write:
-		p.wOpen()
-		return fs.NewFile(ctx, d, flags, &Writer{
-			ReaderWriter: ReaderWriter{Pipe: p},
-		})
-	default:
-		// Precondition violated.
-		panic("invalid pipe flags")
-	}
 }
 
 // peekLocked passes the first count bytes in the pipe to f and returns its
@@ -254,8 +191,8 @@ func (p *Pipe) Open(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) *fs.F
 // unlocked.)
 //
 // Preconditions:
-// * p.mu must be locked.
-// * This pipe must have readers.
+//   - p.mu must be locked.
+//   - This pipe must have readers.
 func (p *Pipe) peekLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Don't block for a zero-length read even if the pipe is empty.
 	if count == 0 {
@@ -285,8 +222,8 @@ func (p *Pipe) peekLocked(count int64, f func(safemem.BlockSeq) (uint64, error))
 // longer be visible to future reads.
 //
 // Preconditions:
-// * p.mu must be locked.
-// * The pipe must contain at least n bytes.
+//   - p.mu must be locked.
+//   - The pipe must contain at least n bytes.
 func (p *Pipe) consumeLocked(n int64) {
 	p.off += n
 	if max := int64(len(p.buf)); p.off >= max {
@@ -308,7 +245,7 @@ func (p *Pipe) consumeLocked(n int64) {
 // p.queue.Notify(waiter.ReadableEvents) with p.mu unlocked.
 //
 // Preconditions:
-// * p.mu must be locked.
+//   - p.mu must be locked.
 func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Can't write to a pipe with no readers.
 	if !p.HasReaders() {
@@ -382,8 +319,8 @@ func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)
 
 // rOpen signals a new reader of the pipe.
 func (p *Pipe) rOpen() {
-	atomic.AddInt32(&p.readers, 1)
-	atomic.AddInt32(&p.totalReaders, 1)
+	p.readers.Add(1)
+	p.totalReaders.Add(1)
 
 	// Notify for blocking openers.
 	p.queue.Notify(waiter.EventInternal)
@@ -393,8 +330,8 @@ func (p *Pipe) rOpen() {
 func (p *Pipe) wOpen() {
 	p.mu.Lock()
 	p.hadWriter = true
-	atomic.AddInt32(&p.writers, 1)
-	atomic.AddInt32(&p.totalWriters, 1)
+	p.writers.Add(1)
+	p.totalWriters.Add(1)
 	p.mu.Unlock()
 
 	// Notify for blocking openers.
@@ -403,26 +340,26 @@ func (p *Pipe) wOpen() {
 
 // rClose signals that a reader has closed their end of the pipe.
 func (p *Pipe) rClose() {
-	if newReaders := atomic.AddInt32(&p.readers, -1); newReaders < 0 {
+	if newReaders := p.readers.Add(-1); newReaders < 0 {
 		panic(fmt.Sprintf("Refcounting bug, pipe has negative readers: %v", newReaders))
 	}
 }
 
 // wClose signals that a writer has closed their end of the pipe.
 func (p *Pipe) wClose() {
-	if newWriters := atomic.AddInt32(&p.writers, -1); newWriters < 0 {
+	if newWriters := p.writers.Add(-1); newWriters < 0 {
 		panic(fmt.Sprintf("Refcounting bug, pipe has negative writers: %v.", newWriters))
 	}
 }
 
 // HasReaders returns whether the pipe has any active readers.
 func (p *Pipe) HasReaders() bool {
-	return atomic.LoadInt32(&p.readers) > 0
+	return p.readers.Load() > 0
 }
 
 // HasWriters returns whether the pipe has any active writers.
 func (p *Pipe) HasWriters() bool {
-	return atomic.LoadInt32(&p.writers) > 0
+	return p.writers.Load() > 0
 }
 
 // rReadinessLocked calculates the read readiness.
@@ -503,20 +440,13 @@ func (p *Pipe) queuedLocked() int64 {
 	return p.size
 }
 
-// FifoSize implements fs.FifoSizer.FifoSize.
-func (p *Pipe) FifoSize(context.Context, *fs.File) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.max, nil
-}
-
 // SetFifoSize implements fs.FifoSizer.SetFifoSize.
 func (p *Pipe) SetFifoSize(size int64) (int64, error) {
 	if size < 0 {
 		return 0, linuxerr.EINVAL
 	}
-	if size < MinimumPipeSize {
-		size = MinimumPipeSize // Per spec.
+	if size < int64(MinimumPipeSize) {
+		size = int64(MinimumPipeSize) // Per spec.
 	}
 	if size > MaximumPipeSize {
 		return 0, linuxerr.EPERM

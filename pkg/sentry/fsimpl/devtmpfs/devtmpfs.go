@@ -127,7 +127,7 @@ func (a *Accessor) wrapContext(ctx context.Context) *accessorContext {
 }
 
 // Value implements context.Context.Value.
-func (ac *accessorContext) Value(key interface{}) interface{} {
+func (ac *accessorContext) Value(key any) any {
 	switch key {
 	case vfs.CtxMountNamespace:
 		ac.a.mntns.IncRef()
@@ -168,7 +168,7 @@ func (a *Accessor) CreateDeviceFile(ctx context.Context, pathname string, kind v
 	parent := path.Dir(pathname)
 	if err := a.vfsObj.MkdirAllAt(ctx, parent, a.root, a.creds, &vfs.MkdirOptions{
 		Mode: 0755,
-	}); err != nil {
+	}, true /* mustBeDir */); err != nil {
 		return fmt.Errorf("failed to create device parent directory %q: %v", parent, err)
 	}
 

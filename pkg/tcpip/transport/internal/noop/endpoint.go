@@ -137,7 +137,7 @@ func (*endpoint) GetSockOptInt(tcpip.SockOptInt) (int, tcpip.Error) {
 }
 
 // HandlePacket implements stack.RawTransportEndpoint.HandlePacket.
-func (*endpoint) HandlePacket(pkt *stack.PacketBuffer) {
+func (*endpoint) HandlePacket(pkt stack.PacketBufferPtr) {
 	panic(fmt.Sprintf("unreachable: noop.endpoint should never be registered, but got packet: %+v", pkt))
 }
 
@@ -148,6 +148,11 @@ func (*endpoint) State() uint32 {
 
 // Wait implements stack.TransportEndpoint.Wait.
 func (*endpoint) Wait() {
+	// No-op.
+}
+
+// Release implements stack.TransportEndpoint.Release.
+func (*endpoint) Release() {
 	// No-op.
 }
 

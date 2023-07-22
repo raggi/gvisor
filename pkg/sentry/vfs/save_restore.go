@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -122,8 +122,8 @@ func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
 
 // afterLoad is called by stateify.
 func (mnt *Mount) afterLoad() {
-	if atomic.LoadInt64(&mnt.refs) != 0 {
-		refsvfs2.Register(mnt)
+	if mnt.refs.Load() != 0 {
+		refs.Register(mnt)
 	}
 }
 

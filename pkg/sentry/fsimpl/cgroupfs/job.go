@@ -15,36 +15,39 @@
 package cgroupfs
 
 import (
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
 // +stateify savable
 type jobController struct {
 	controllerCommon
-	controllerNoopMigrate
+	controllerStateless
+	controllerNoResource
 
-	id int64
+	id atomicbitops.Int64
 }
 
 var _ controller = (*jobController)(nil)
 
 func newJobController(fs *filesystem) *jobController {
 	c := &jobController{}
-	c.controllerCommon.init(controllerJob, fs)
+	c.controllerCommon.init(kernel.CgroupControllerJob, fs)
 	return c
 }
 
 // Clone implements controller.Clone.
 func (c *jobController) Clone() controller {
 	new := &jobController{
-		id: c.id,
+		id: atomicbitops.FromInt64(c.id.Load()),
 	}
-	new.controllerCommon.cloneFrom(&c.controllerCommon)
+	new.controllerCommon.cloneFromParent(c)
 	return new
 }
 
 func (c *jobController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
-	contents["job.id"] = c.fs.newStubControllerFile(ctx, creds, &c.id)
+	contents["job.id"] = c.fs.newStubControllerFile(ctx, creds, &c.id, true)
 }

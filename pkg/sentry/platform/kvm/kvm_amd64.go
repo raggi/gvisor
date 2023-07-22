@@ -20,6 +20,7 @@ package kvm
 import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
 // userRegs represents KVM user registers.
@@ -205,7 +206,7 @@ func (c *cpuidEntries) Set(in cpuid.In, out cpuid.Out) {
 		}
 	}
 	if i == _KVM_NR_CPUID_ENTRIES {
-		panic("exceede KVM_NR_CPUID_ENTRIES")
+		panic("exceeded KVM_NR_CPUID_ENTRIES")
 	}
 
 	c.entries[i].eax = out.Eax
@@ -219,7 +220,11 @@ func (c *cpuidEntries) Set(in cpuid.In, out cpuid.Out) {
 
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
-	err := updateSystemValues(int(fd))
+	fpu.InitHostState()
+	bitsForScaling = getBitsForScaling()
+	if err := updateSystemValues(int(fd)); err != nil {
+		return err
+	}
 	fs := cpuid.FeatureSet{
 		Function: &cpuidSupported,
 	}
@@ -238,5 +243,5 @@ func updateGlobalOnce(fd int) error {
 		Function: s,
 	})
 	physicalInit()
-	return err
+	return nil
 }

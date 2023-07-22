@@ -21,9 +21,9 @@ import (
 	"os"
 	"path"
 	"strings"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -126,7 +126,7 @@ func (t *Tversion) handle(cs *connState) message {
 	if t.MSize > maximumLength {
 		return newErr(unix.EINVAL)
 	}
-	atomic.StoreUint32(&cs.messageSize, t.MSize)
+	cs.messageSize.Store(t.MSize)
 	requested, ok := parseVersion(t.Version)
 	if !ok {
 		return newErr(unix.EINVAL)
@@ -138,7 +138,7 @@ func (t *Tversion) handle(cs *connState) message {
 	}
 	// From Tversion(9P): "The server may respond with the client’s version
 	// string, or a version string identifying an earlier defined protocol version".
-	atomic.StoreUint32(&cs.version, requested)
+	cs.version.Store(requested)
 	return &Rversion{
 		MSize:   t.MSize,
 		Version: t.Version,
@@ -299,7 +299,7 @@ func (t *Tattach) handle(cs *connState) message {
 		server:   cs.server,
 		parent:   nil,
 		file:     sf,
-		refs:     1,
+		refs:     atomicbitops.FromInt64(1),
 		mode:     attr.Mode.FileType(),
 		pathNode: cs.server.pathTree,
 	}
@@ -1093,7 +1093,7 @@ func (t *Treaddir) handle(cs *connState) message {
 		}
 
 		// Read the entries.
-		entries, err = ref.file.Readdir(t.Offset, t.Count)
+		entries, err = ref.file.Readdir(t.DirentOffset, t.Count)
 		if err != nil && err != io.EOF {
 			return err
 		}
@@ -1582,7 +1582,7 @@ func (t *Tmultigetattr) handle(cs *connState) message {
 		}
 
 		parentNode.opMu.RLock()
-		if atomic.LoadUint32(&parentNode.deleted) != 0 {
+		if parentNode.deleted.Load() != 0 {
 			parentNode.opMu.RUnlock()
 			break
 		}

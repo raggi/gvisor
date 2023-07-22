@@ -19,7 +19,6 @@ package kvm
 
 import (
 	"fmt"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -46,7 +45,7 @@ func (c *vCPU) loadSegments(tid uint64) {
 		0); errno != 0 {
 		throw("getting GS segment")
 	}
-	atomic.StoreUint64(&c.tid, tid)
+	c.tid.Store(tid)
 }
 
 // setCPUID sets the CPUID to be used by the guest.
@@ -84,6 +83,29 @@ func (c *vCPU) setTSCFreq(freq uintptr) error {
 		_KVM_SET_TSC_KHZ,
 		freq /* khz */); errno != 0 {
 		return fmt.Errorf("error setting TSC frequency: %v", errno)
+	}
+	return nil
+}
+
+// setTSCOffset sets the TSC offset to zero.
+func (c *vCPU) setTSCOffset() error {
+	offset := uint64(0)
+	da := struct {
+		flags uint32
+		group uint32
+		attr  uint64
+		addr  unsafe.Pointer
+	}{
+		group: _KVM_VCPU_TSC_CTRL,
+		attr:  _KVM_VCPU_TSC_OFFSET,
+		addr:  unsafe.Pointer(&offset),
+	}
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		_KVM_SET_DEVICE_ATTR,
+		uintptr(unsafe.Pointer(&da))); errno != 0 {
+		return fmt.Errorf("error setting tsc offset: %v", errno)
 	}
 	return nil
 }

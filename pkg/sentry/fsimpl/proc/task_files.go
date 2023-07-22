@@ -18,13 +18,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -133,56 +134,35 @@ func (d *auxvData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
-// execArgType enumerates the types of exec arguments that are exposed through
-// proc.
-type execArgType int
+// MetadataType enumerates the types of metadata that is exposed through proc.
+type MetadataType int
 
 const (
-	cmdlineDataArg execArgType = iota
-	environDataArg
+	// Cmdline represents /proc/[pid]/cmdline.
+	Cmdline MetadataType = iota
+
+	// Environ represents /proc/[pid]/environ.
+	Environ
 )
 
-// cmdlineData implements vfs.DynamicBytesSource for /proc/[pid]/cmdline.
-//
-// +stateify savable
-type cmdlineData struct {
-	kernfs.DynamicBytesFile
-
-	task *kernel.Task
-
-	// arg is the type of exec argument this file contains.
-	arg execArgType
-}
-
-var _ dynamicInode = (*cmdlineData)(nil)
-
-// Generate implements vfs.DynamicBytesSource.Generate.
-func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	if d.task.ExitState() == kernel.TaskExitDead {
-		return linuxerr.ESRCH
-	}
-	m, err := getMMIncRef(d.task)
-	if err != nil {
-		// Return empty file.
-		return nil
-	}
-	defer m.DecUsers(ctx)
-
+// GetMetadata fetches the process's metadata of type t and writes it into
+// buf. The process is identified by mm.
+func GetMetadata(ctx context.Context, mm *mm.MemoryManager, buf *bytes.Buffer, t MetadataType) error {
 	// Figure out the bounds of the exec arg we are trying to read.
 	var ar hostarch.AddrRange
-	switch d.arg {
-	case cmdlineDataArg:
+	switch t {
+	case Cmdline:
 		ar = hostarch.AddrRange{
-			Start: m.ArgvStart(),
-			End:   m.ArgvEnd(),
+			Start: mm.ArgvStart(),
+			End:   mm.ArgvEnd(),
 		}
-	case environDataArg:
+	case Environ:
 		ar = hostarch.AddrRange{
-			Start: m.EnvvStart(),
-			End:   m.EnvvEnd(),
+			Start: mm.EnvvStart(),
+			End:   mm.EnvvEnd(),
 		}
 	default:
-		panic(fmt.Sprintf("unknown exec arg type %v", d.arg))
+		panic(fmt.Sprintf("unknown exec arg type %v", t))
 	}
 	if ar.Start == 0 || ar.End == 0 {
 		// Don't attempt to read before the start/end are set up.
@@ -193,7 +173,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// until Linux 4.9 (272ddc8b3735 "proc: don't use FOLL_FORCE for reading
 	// cmdline and environment").
 	writer := &bufferWriter{buf: buf}
-	if n, err := m.CopyInTo(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
+	if n, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
 		// Nothing to copy or something went wrong.
 		return err
 	}
@@ -201,7 +181,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// On Linux, if the NULL byte at the end of the argument vector has been
 	// overwritten, it continues reading the environment vector as part of
 	// the argument vector.
-	if d.arg == cmdlineDataArg && buf.Bytes()[buf.Len()-1] != 0 {
+	if t == Cmdline && buf.Bytes()[buf.Len()-1] != 0 {
 		if end := bytes.IndexByte(buf.Bytes(), 0); end != -1 {
 			// If we found a NULL character somewhere else in argv, truncate the
 			// return up to the NULL terminator (including it).
@@ -211,8 +191,8 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 		// There is no NULL terminator in the string, return into envp.
 		arEnvv := hostarch.AddrRange{
-			Start: m.EnvvStart(),
-			End:   m.EnvvEnd(),
+			Start: mm.EnvvStart(),
+			End:   mm.EnvvEnd(),
 		}
 
 		// Upstream limits the returned amount to one page of slop.
@@ -231,7 +211,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 			}
 			arEnvv.End = end
 		}
-		if _, err := m.CopyInTo(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
+		if _, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
 			return err
 		}
 
@@ -244,6 +224,37 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 
 	return nil
+}
+
+// metadataData implements vfs.DynamicBytesSource for proc metadata fields like:
+//
+//   - /proc/[pid]/cmdline
+//   - /proc/[pid]/environ
+//
+// +stateify savable
+type metadataData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+
+	// arg is the type of exec argument this file contains.
+	metaType MetadataType
+}
+
+var _ dynamicInode = (*metadataData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *metadataData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if d.task.ExitState() == kernel.TaskExitDead {
+		return linuxerr.ESRCH
+	}
+	m, err := getMMIncRef(d.task)
+	if err != nil {
+		// Return empty file.
+		return nil
+	}
+	defer m.DecUsers(ctx)
+	return GetMetadata(ctx, m, buf, d.metaType)
 }
 
 // +stateify savable
@@ -262,9 +273,6 @@ func (fs *filesystem) newComm(ctx context.Context, task *kernel.Task, ino uint64
 func (i *commInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	// This file can always be read or written by members of the same thread
 	// group. See fs/proc/base.c:proc_tid_comm_permission.
-	//
-	// N.B. This check is currently a no-op as we don't yet support writing and
-	// this file is world-readable anyways.
 	t := kernel.TaskFromContext(ctx)
 	if t != nil && t.ThreadGroup() == i.task.ThreadGroup() && !ats.MayExec() {
 		return nil
@@ -273,7 +281,7 @@ func (i *commInode) CheckPermissions(ctx context.Context, creds *auth.Credential
 	return i.DynamicBytesFile.CheckPermissions(ctx, creds, ats)
 }
 
-// commData implements vfs.DynamicBytesSource for /proc/[pid]/comm.
+// commData implements vfs.WritableDynamicBytesSource for /proc/[pid]/comm.
 //
 // +stateify savable
 type commData struct {
@@ -283,12 +291,34 @@ type commData struct {
 }
 
 var _ dynamicInode = (*commData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*commData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *commData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(d.task.Name())
 	buf.WriteString("\n")
 	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *commData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	srclen := src.NumBytes()
+	name := make([]byte, srclen)
+	if _, err := src.CopyIn(ctx, name); err != nil {
+		return 0, err
+	}
+
+	// Only allow writes from the same thread group, otherwise return
+	// EINVAL. See fs/proc/base.c:comm_write.
+	//
+	// Note that this check exists in addition to the same-thread-group
+	// check in CheckPermissions.
+	t := kernel.TaskFromContext(ctx)
+	if t == nil || t.ThreadGroup() != d.task.ThreadGroup() {
+		return 0, linuxerr.EINVAL
+	}
+	d.task.SetName(string(name))
+	return int64(srclen), nil
 }
 
 // idMapData implements vfs.WritableDynamicBytesSource for
@@ -325,7 +355,7 @@ func (d *idMapData) Write(ctx context.Context, _ *vfs.FileDescription, src userm
 	// the system page size, and the write must be performed at the start of
 	// the file ..." - user_namespaces(7)
 	srclen := src.NumBytes()
-	if srclen >= hostarch.PageSize || offset != 0 {
+	if srclen >= int64(hostarch.PageSize) || offset != 0 {
 		return 0, linuxerr.EINVAL
 	}
 	b := make([]byte, srclen)
@@ -382,8 +412,10 @@ type memInode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoStatFS
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	locks vfs.FileLocks
@@ -519,6 +551,44 @@ func (fd *memFD) SetStat(context.Context, vfs.SetStatOptions) error {
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *memFD) Release(context.Context) {}
 
+// limitsData implements vfs.DynamicBytesSource for /proc/[pid]/limits.
+//
+// +stateify savable
+type limitsData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+}
+
+func (d *limitsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	taskLimits := d.task.Limits()
+	// formatting matches the kernel output from linux/fs/proc/base.c:proc_pid_limits()
+	fmt.Fprintf(buf, "Limit                     Soft Limit           Hard Limit           Units     \n")
+	for _, lt := range limits.AllLimitTypes {
+		fmt.Fprintf(buf, "%-25s ", lt.Name())
+
+		l := taskLimits.Get(lt)
+		if l.Cur == limits.Infinity {
+			fmt.Fprintf(buf, "%-20s ", "unlimited")
+		} else {
+			fmt.Fprintf(buf, "%-20d ", l.Cur)
+		}
+
+		if l.Max == limits.Infinity {
+			fmt.Fprintf(buf, "%-20s ", "unlimited")
+		} else {
+			fmt.Fprintf(buf, "%-20d ", l.Max)
+		}
+
+		if u := lt.Unit(); u != "" {
+			fmt.Fprintf(buf, "%-10s", u)
+		}
+
+		buf.WriteByte('\n')
+	}
+	return nil
+}
+
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
 //
 // +stateify savable
@@ -533,7 +603,7 @@ var _ dynamicInode = (*mapsData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *mapsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	if mm := getMM(d.task); mm != nil {
-		mm.ReadMapsDataInto(ctx, buf)
+		mm.ReadMapsDataInto(ctx, mm.MapsCallbackFuncForBuffer(buf))
 	}
 	return nil
 }
@@ -613,7 +683,7 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d ", vss, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d ", vss, rss/uint64(hostarch.PageSize))
 
 	// rsslim.
 	fmt.Fprintf(buf, "%d ", s.task.ThreadGroup().Limits().Get(limits.Rss).Cur)
@@ -652,7 +722,7 @@ func (s *statmData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss/hostarch.PageSize, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss/uint64(hostarch.PageSize), rss/uint64(hostarch.PageSize))
 	return nil
 }
 
@@ -663,8 +733,10 @@ type statusInode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoStatFS
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	pidns *kernel.PIDNamespace
@@ -786,7 +858,7 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, euid)
 	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, egid)
 	fmt.Fprintf(buf, "FDSize:\t%d\n", fds)
-	buf.WriteString("Groups:\t ")
+	buf.WriteString("Groups:\t")
 	// There is a space between each pair of supplemental GIDs, as well as an
 	// unconditional trailing space that some applications actually depend on.
 	var sep string
@@ -833,13 +905,13 @@ func (i *ioData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	io := usage.IO{}
 	io.Accumulate(i.IOUsage())
 
-	fmt.Fprintf(buf, "char: %d\n", io.CharsRead)
-	fmt.Fprintf(buf, "wchar: %d\n", io.CharsWritten)
-	fmt.Fprintf(buf, "syscr: %d\n", io.ReadSyscalls)
-	fmt.Fprintf(buf, "syscw: %d\n", io.WriteSyscalls)
-	fmt.Fprintf(buf, "read_bytes: %d\n", io.BytesRead)
-	fmt.Fprintf(buf, "write_bytes: %d\n", io.BytesWritten)
-	fmt.Fprintf(buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled)
+	fmt.Fprintf(buf, "char: %d\n", io.CharsRead.RacyLoad())
+	fmt.Fprintf(buf, "wchar: %d\n", io.CharsWritten.RacyLoad())
+	fmt.Fprintf(buf, "syscr: %d\n", io.ReadSyscalls.RacyLoad())
+	fmt.Fprintf(buf, "syscw: %d\n", io.WriteSyscalls.RacyLoad())
+	fmt.Fprintf(buf, "read_bytes: %d\n", io.BytesRead.RacyLoad())
+	fmt.Fprintf(buf, "write_bytes: %d\n", io.BytesWritten.RacyLoad())
+	fmt.Fprintf(buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled.RacyLoad())
 	return nil
 }
 
@@ -872,20 +944,25 @@ func (o *oomScoreAdj) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	// Limit input size so as not to impact performance if input size is large.
 	src = src.TakeFirst(hostarch.PageSize - 1)
 
-	var v int32
-	n, err := usermem.CopyInt32StringInVec(ctx, src.IO, src.Addrs, &v, src.Opts)
-	if err != nil {
+	str, err := usermem.CopyStringIn(ctx, src.IO, src.Addrs.Head().Start, int(src.Addrs.Head().Length()), src.Opts)
+	if err != nil && err != linuxerr.ENAMETOOLONG {
 		return 0, err
+	}
+
+	str = strings.TrimSpace(str)
+	v, err := strconv.ParseInt(str, 0, 32)
+	if err != nil {
+		return 0, linuxerr.EINVAL
 	}
 
 	if o.task.ExitState() == kernel.TaskExitDead {
 		return 0, linuxerr.ESRCH
 	}
-	if err := o.task.SetOOMScoreAdj(v); err != nil {
+	if err := o.task.SetOOMScoreAdj(int32(v)); err != nil {
 		return 0, err
 	}
 
-	return n, nil
+	return src.NumBytes(), nil
 }
 
 // exeSymlink is an symlink for the /proc/[pid]/exe file.
@@ -895,7 +972,9 @@ type exeSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -922,8 +1001,7 @@ func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -955,7 +1033,7 @@ func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	}
 	defer exec.DecRef(ctx)
 
-	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
+	vd := exec.VirtualDentry()
 	vd.IncRef()
 	return vd, "", nil
 }
@@ -967,7 +1045,9 @@ type cwdSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -994,8 +1074,7 @@ func (s *cwdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -1012,13 +1091,75 @@ func (s *cwdSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	cwd := s.task.FSContext().WorkingDirectoryVFS2()
+	cwd := s.task.FSContext().WorkingDirectory()
 	if !cwd.Ok() {
 		// It could have raced with process deletion.
 		return vfs.VirtualDentry{}, "", linuxerr.ESRCH
 	}
 	// The reference is transferred to the caller.
 	return cwd, "", nil
+}
+
+// rootSymlink is an symlink for the /proc/[pid]/root file.
+//
+// +stateify savable
+type rootSymlink struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
+	kernfs.InodeSymlink
+	kernfs.InodeWatches
+
+	fs   *filesystem
+	task *kernel.Task
+}
+
+var _ kernfs.Inode = (*rootSymlink)(nil)
+
+func (fs *filesystem) newRootSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
+	inode := &rootSymlink{
+		fs:   fs,
+		task: task,
+	}
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	return inode
+}
+
+// Readlink implements kernfs.Inode.Readlink.
+func (s *rootSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	root, _, err := s.Getlink(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer s.fs.SafeDecRef(ctx, root)
+
+	vfsRoot := vfs.RootFromContext(ctx)
+	if !vfsRoot.Ok() {
+		panic("procfs Readlink requires context with root value")
+	}
+	defer s.fs.SafeDecRef(ctx, vfsRoot)
+
+	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, vfsRoot, root)
+	return name, nil
+}
+
+// Getlink implements kernfs.Inode.Getlink.
+func (s *rootSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if !kernel.ContextCanTrace(ctx, s.task, false) {
+		return vfs.VirtualDentry{}, "", linuxerr.EACCES
+	}
+	if err := checkTaskState(s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	root := s.task.FSContext().RootDirectory()
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return vfs.VirtualDentry{}, "", linuxerr.ESRCH
+	}
+	// The reference is transferred to the caller.
+	return root, "", nil
 }
 
 // mountInfoData is used to implement /proc/[pid]/mountinfo.
@@ -1043,7 +1184,7 @@ func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// The task has been destroyed. Nothing to show here.
 		return nil
 	}
-	rootDir := fsctx.RootDirectoryVFS2()
+	rootDir := fsctx.RootDirectory()
 	if !rootDir.Ok() {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
@@ -1075,7 +1216,7 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// The task has been destroyed. Nothing to show here.
 		return nil
 	}
-	rootDir := fsctx.RootDirectoryVFS2()
+	rootDir := fsctx.RootDirectory()
 	if !rootDir.Ok() {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
@@ -1092,7 +1233,18 @@ type namespaceSymlink struct {
 	task *kernel.Task
 }
 
-func (fs *filesystem) newNamespaceSymlink(ctx context.Context, task *kernel.Task, ino uint64, ns string) kernfs.Inode {
+func (fs *filesystem) newPIDNamespaceSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
+	target := fmt.Sprintf("pid:[%d]", task.PIDNamespace().ID())
+
+	inode := &namespaceSymlink{task: task}
+	// Note: credentials are overridden by taskOwnedInode.
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
+
+	taskInode := &taskOwnedInode{Inode: inode, owner: task}
+	return taskInode
+}
+
+func (fs *filesystem) newFakeNamespaceSymlink(ctx context.Context, task *kernel.Task, ino uint64, ns string) kernfs.Inode {
 	// Namespace symlinks should contain the namespace name and the inode number
 	// for the namespace instance, so for example user:[123456]. We currently fake
 	// the inode number by sticking the symlink inode in its place.
@@ -1140,8 +1292,10 @@ type namespaceInode struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 }

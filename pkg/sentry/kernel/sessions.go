@@ -202,11 +202,11 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
 		if tg.groupStopComplete {
 			hasStopped = true
 		}
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 	if !hasStopped {
 		return
@@ -217,10 +217,10 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 
 	return
@@ -232,7 +232,7 @@ func (pg *ProcessGroup) Session() *Session {
 }
 
 // SendSignal sends a signal to all processes inside the process group. It is
-// analagous to kernel/signal.c:kill_pgrp.
+// analogous to kernel/signal.c:kill_pgrp.
 func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 	tasks := pg.originator.TaskSet()
 	tasks.mu.RLock()
@@ -439,6 +439,11 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID, checkExec bool) error {
 	pidns.owner.mu.Lock()
 	defer pidns.owner.mu.Unlock()
+
+	// Check whether the process still exists or not.
+	if _, ok := pidns.tgids[tg]; !ok {
+		return linuxerr.ESRCH
+	}
 
 	// Lookup the ProcessGroup.
 	pg := pidns.processGroups[pgid]

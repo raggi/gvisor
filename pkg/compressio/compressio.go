@@ -35,9 +35,9 @@
 //
 // where each subsequent hash is calculated from the following items in order
 //
-//     compressed data
-//     compressed data size
-//     previous hash
+//	compressed data
+//	compressed data size
+//	previous hash
 //
 // so the stream integrity cannot be compromised by switching and mixing
 // compressed chunks.
@@ -58,13 +58,13 @@ import (
 )
 
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return bytes.NewBuffer(nil)
 	},
 }
 
 var chunkPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(chunk)
 	},
 }

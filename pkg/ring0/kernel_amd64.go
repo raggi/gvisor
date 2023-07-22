@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"reflect"
 
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
@@ -40,7 +41,7 @@ func (k *Kernel) init(maxCPUs int) {
 		entries = make([]kernelEntry, maxCPUs+padding-1)
 		totalSize := entrySize * uintptr(maxCPUs+padding-1)
 		addr := reflect.ValueOf(&entries[0]).Pointer()
-		if addr&(hostarch.PageSize-1) == 0 && totalSize >= hostarch.PageSize {
+		if addr&uintptr(hostarch.PageSize-1) == 0 && totalSize >= uintptr(hostarch.PageSize) {
 			// The runtime forces power-of-2 alignment for allocations, and we are therefore
 			// safe once the first address is aligned and the chunk is at least a full page.
 			break
@@ -50,10 +51,10 @@ func (k *Kernel) init(maxCPUs int) {
 	k.cpuEntries = entries
 
 	k.globalIDT = &idt64{}
-	if reflect.TypeOf(idt64{}).Size() != hostarch.PageSize {
+	if reflect.TypeOf(idt64{}).Size() != uintptr(hostarch.PageSize) {
 		panic("Size of globalIDT should be PageSize")
 	}
-	if reflect.ValueOf(k.globalIDT).Pointer()&(hostarch.PageSize-1) != 0 {
+	if reflect.ValueOf(k.globalIDT).Pointer()&uintptr(hostarch.PageSize-1) != 0 {
 		panic("Allocated globalIDT should be page aligned")
 	}
 
@@ -214,7 +215,7 @@ func (c *CPU) EFER() uint64 {
 //
 //go:nosplit
 func IsCanonical(addr uint64) bool {
-	return addr <= 0x00007fffffffffff || addr > 0xffff800000000000
+	return addr <= 0x00007fffffffffff || addr >= 0xffff800000000000
 }
 
 // SwitchToUser performs either a sysret or an iret.
@@ -272,11 +273,11 @@ func doSwitchToUser(
 // registers in c.registers will be restored (not segments).
 //
 // Note that any code written in Go should adhere to Go expected environment:
-// * Initialized floating point state (required for optimizations using
-//   floating point instructions).
-// * Go TLS in FS_BASE (this is required by splittable functions, calls into
-//   the runtime, calls to assembly functions (Go 1.17+ ABI wrappers access
-//   TLS)).
+//   - Initialized floating point state (required for optimizations using
+//     floating point instructions).
+//   - Go TLS in FS_BASE (this is required by splittable functions, calls into
+//     the runtime, calls to assembly functions (Go 1.17+ ABI wrappers access
+//     TLS)).
 //
 //go:nosplit
 func startGo(c *CPU) {
@@ -293,7 +294,10 @@ func startGo(c *CPU) {
 	// Need to sync XCR0 with the host, because xsave and xrstor can be
 	// called from different contexts.
 	if hasXSAVE {
-		xsetbv(0, localXCR0)
+		// Exclude MPX bits. MPX has been deprecated and we have seen
+		// cases when it isn't supported in VM.
+		xcr0 := localXCR0 &^ (cpuid.XSAVEFeatureBNDCSR | cpuid.XSAVEFeatureBNDREGS)
+		xsetbv(0, xcr0)
 	}
 
 	// Set the syscall target.
@@ -333,22 +337,4 @@ func SetCPUIDFaulting(on bool) bool {
 //go:nosplit
 func ReadCR2() uintptr {
 	return readCR2()
-}
-
-// kernelMXCSR is the value of the mxcsr register in the Sentry.
-//
-// The MXCSR control configuration is initialized once and never changed. Look
-// at src/cmd/compile/abi-internal.md in the golang sources for more details.
-var kernelMXCSR uint32
-
-// RestoreKernelFPState restores the Sentry floating point state.
-//
-//go:nosplit
-func RestoreKernelFPState() {
-	// Restore the MXCSR control configuration.
-	ldmxcsr(&kernelMXCSR)
-}
-
-func init() {
-	stmxcsr(&kernelMXCSR)
 }

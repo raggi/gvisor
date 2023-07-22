@@ -17,6 +17,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strconv"
 
@@ -35,7 +36,7 @@ func (i *intFlags) String() string {
 }
 
 // Get implements flag.Value.
-func (i *intFlags) Get() interface{} {
+func (i *intFlags) Get() any {
 	return i
 }
 
@@ -50,8 +51,8 @@ func (i *intFlags) Set(s string) error {
 	if err != nil {
 		return fmt.Errorf("invalid flag value: %v", err)
 	}
-	if fd < 0 {
-		return fmt.Errorf("flag value must be greater than 0: %d", fd)
+	if fd < -1 {
+		return fmt.Errorf("flag value must be >= -1: %d", fd)
 	}
 	*i = append(*i, fd)
 	return nil
@@ -71,7 +72,7 @@ func setCapsAndCallSelf(args []string, caps *specs.LinuxCapabilities) error {
 	binPath := specutils.ExePath
 
 	log.Infof("Execve %q again, bye!", binPath)
-	err := unix.Exec(binPath, args, []string{})
+	err := unix.Exec(binPath, args, os.Environ())
 	return fmt.Errorf("error executing %s: %v", binPath, err)
 }
 
@@ -89,10 +90,14 @@ func callSelfAsNobody(args []string) error {
 	if _, _, err := unix.RawSyscall(unix.SYS_SETUID, uintptr(nobody), 0, 0); err != 0 {
 		return fmt.Errorf("error setting gid: %v", err)
 	}
+	// Drop all capabilities.
+	if err := applyCaps(&specs.LinuxCapabilities{}); err != nil {
+		return fmt.Errorf("error dropping capabilities: %w", err)
+	}
 
 	binPath := specutils.ExePath
 
 	log.Infof("Execve %q again, bye!", binPath)
-	err := unix.Exec(binPath, args, []string{})
+	err := unix.Exec(binPath, args, os.Environ())
 	return fmt.Errorf("error executing %s: %v", binPath, err)
 }

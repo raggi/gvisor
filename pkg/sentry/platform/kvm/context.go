@@ -15,8 +15,6 @@
 package kvm
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -47,10 +45,11 @@ type tryCPUIDError struct{}
 func (tryCPUIDError) Error() string { return "cpuid emulation failed" }
 
 // Switch runs the provided context in the given address space.
-func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac arch.Context, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	localAS := as.(*addressSpace)
 
+restart:
 	// Grab a vCPU.
 	cpu := c.machine.Get()
 
@@ -69,7 +68,6 @@ func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac a
 	// that the flush can occur naturally on the next user entry.
 	cpu.active.set(localAS)
 
-restart:
 	// Prepare switch options.
 	switchOpts := ring0.SwitchOpts{
 		Registers:          &ac.StateData().Regs,
@@ -81,9 +79,29 @@ restart:
 
 	// Take the blue pill.
 	at, err := cpu.SwitchToUser(switchOpts, &c.info)
+
+	// Clear the address space.
+	cpu.active.set(nil)
+
+	// Increment the number of user exits.
+	cpu.userExits.Add(1)
+	userExitCounter.Increment()
+
+	// Release resources.
+	c.machine.Put(cpu)
+
+	// All done.
+	c.interrupt.Disable()
+
 	if err != nil {
 		if _, ok := err.(tryCPUIDError); ok {
 			// Does emulation work for the CPUID?
+			//
+			// We have to put the current vCPU, because
+			// TryCPUIDEmulate needs to read a user memory and it
+			// has to lock mm.activeMu for that, but it can race
+			// with as.invalidate that bonce all vcpu-s to gr0 and
+			// is called under mm.activeMu too.
 			if platform.TryCPUIDEmulate(ctx, mm, ac) {
 				goto restart
 			}
@@ -92,18 +110,6 @@ restart:
 			err = platform.ErrContextSignal
 		}
 	}
-
-	// Clear the address space.
-	cpu.active.set(nil)
-
-	// Increment the number of user exits.
-	atomic.AddUint64(&cpu.userExits, 1)
-
-	// Release resources.
-	c.machine.Put(cpu)
-
-	// All done.
-	c.interrupt.Disable()
 	return &c.info, at, err
 }
 
@@ -119,4 +125,7 @@ func (c *context) Release() {}
 func (c *context) FullStateChanged() {}
 
 // PullFullState implements platform.Context.PullFullState.
-func (c *context) PullFullState(as platform.AddressSpace, ac arch.Context) {}
+func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) error { return nil }
+
+// PrepareSleep implements platform.Context.platform.Context.
+func (*context) PrepareSleep() {}

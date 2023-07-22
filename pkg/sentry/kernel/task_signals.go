@@ -18,7 +18,6 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -187,7 +186,6 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 	switch sigact {
 	case SignalActionTerm, SignalActionCore:
 		// "Default action is to terminate the process." - signal(7)
-		t.Debugf("Signal %d: terminating thread group", info.Signo)
 
 		// Emit an event channel messages related to this uncaught signal.
 		ucs := &ucspb.UncaughtSignal{
@@ -203,6 +201,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 			ucs.FaultAddr = info.Addr()
 		}
 
+		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", ucs.Pid, ucs.Tid, ucs.FaultAddr, info.Signo)
 		eventchannel.Emit(ucs)
 
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
@@ -265,7 +264,7 @@ func (t *Task) deliverSignalToHandler(info *linux.SignalInfo, act linux.SigActio
 		IO:     mm,
 		Bottom: sp,
 	}
-	mask := t.signalMask
+	mask := linux.SignalSet(t.signalMask.Load())
 	if t.haveSavedSignalMask {
 		mask = t.savedSignalMask
 	}
@@ -289,7 +288,7 @@ func (t *Task) deliverSignalToHandler(info *linux.SignalInfo, act linux.SigActio
 	t.haveSavedSignalMask = false
 
 	// Add our signal mask.
-	newMask := t.signalMask | act.Mask
+	newMask := linux.SignalSet(t.signalMask.Load()) | act.Mask
 	if act.Flags&linux.SA_NODEFER == 0 {
 		newMask |= linux.SignalSetOf(linux.Signal(info.Signo))
 	}
@@ -306,6 +305,10 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 	st := t.Stack()
 	sigset, alt, err := t.Arch().SignalRestore(st, rt, t.k.featureSet)
 	if err != nil {
+		// sigreturn syscalls never return errors.
+		t.Debugf("failed to restore from a signal frame: %v", err)
+		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
+		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		return nil, err
 	}
 
@@ -325,8 +328,8 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 // Sigtimedwait implements the semantics of sigtimedwait(2).
 //
 // Preconditions:
-// * The caller must be running on the task goroutine.
-// * t.exitState < TaskExitZombie.
+//   - The caller must be running on the task goroutine.
+//   - t.exitState < TaskExitZombie.
 func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*linux.SignalInfo, error) {
 	// set is the set of signals we're interested in; invert it to get the set
 	// of signals to block.
@@ -345,8 +348,8 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*linux.
 	// Unblock signals we're waiting for. Remember the original signal mask so
 	// that Task.sendSignalTimerLocked doesn't discard ignored signals that
 	// we're temporarily unblocking.
-	t.realSignalMask = t.signalMask
-	t.setSignalMaskLocked(t.signalMask & mask)
+	t.realSignalMask = linux.SignalSet(t.signalMask.RacyLoad())
+	t.setSignalMaskLocked(t.realSignalMask & mask)
 
 	// Wait for a timeout or new signal.
 	t.tg.signalHandlers.mu.Unlock()
@@ -373,7 +376,6 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*linux.
 //	linuxerr.ESRCH - The task has exited.
 //	linuxerr.EINVAL - The signal is not valid.
 //	linuxerr.EAGAIN - THe signal is realtime, and cannot be queued.
-//
 func (t *Task) SendSignal(info *linux.SignalInfo) error {
 	t.tg.pidns.owner.mu.RLock()
 	defer t.tg.pidns.owner.mu.RUnlock()
@@ -437,7 +439,7 @@ func (t *Task) sendSignalTimerLocked(info *linux.SignalInfo, group bool, timer *
 	// Linux's kernel/signal.c:__send_signal() => prepare_signal() =>
 	// sig_ignored().
 	ignored := computeAction(sig, t.tg.signalHandlers.actions[sig]) == SignalActionIgnore
-	if sigset := linux.SignalSetOf(sig); sigset&t.signalMask == 0 && sigset&t.realSignalMask == 0 && ignored && !t.hasTracer() {
+	if sigset := linux.SignalSetOf(sig); sigset&linux.SignalSet(t.signalMask.RacyLoad()) == 0 && sigset&t.realSignalMask == 0 && ignored && !t.hasTracer() {
 		t.Debugf("Discarding ignored signal %d", sig)
 		if timer != nil {
 			timer.signalRejectedLocked()
@@ -523,20 +525,20 @@ func (t *Task) canReceiveSignalLocked(sig linux.Signal) bool {
 	// Notify that the signal is queued.
 	t.signalQueue.Notify(waiter.EventMask(linux.MakeSignalSet(sig)))
 
-	// - Do not choose tasks that are blocking the signal.
-	if linux.SignalSetOf(sig)&t.signalMask != 0 {
+	//	- Do not choose tasks that are blocking the signal.
+	if linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0 {
 		return false
 	}
-	// - No need to check Task.exitState, as the exit path sets every bit in the
-	// signal mask when it transitions from TaskExitNone to TaskExitInitiated.
-	// - No special case for SIGKILL: SIGKILL already interrupted all tasks in the
-	// task group via applySignalSideEffects => killLocked.
-	// - Do not choose stopped tasks, which cannot handle signals.
+	//	- No need to check Task.exitState, as the exit path sets every bit in the
+	//		signal mask when it transitions from TaskExitNone to TaskExitInitiated.
+	//	- No special case for SIGKILL: SIGKILL already interrupted all tasks in the
+	//		task group via applySignalSideEffects => killLocked.
+	//	- Do not choose stopped tasks, which cannot handle signals.
 	if t.stop != nil {
 		return false
 	}
-	// - Do not choose tasks that have already been interrupted, as they may be
-	// busy handling another signal.
+	//	- Do not choose tasks that have already been interrupted, as they may be
+	//		busy handling another signal.
 	if len(t.interruptChan) != 0 {
 		return false
 	}
@@ -571,28 +573,28 @@ func (t *Task) forceSignal(sig linux.Signal, unconditional bool) {
 }
 
 func (t *Task) forceSignalLocked(sig linux.Signal, unconditional bool) {
-	blocked := linux.SignalSetOf(sig)&t.signalMask != 0
+	blocked := linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0
 	act := t.tg.signalHandlers.actions[sig]
 	ignored := act.Handler == linux.SIG_IGN
 	if blocked || ignored || unconditional {
 		act.Handler = linux.SIG_DFL
 		t.tg.signalHandlers.actions[sig] = act
 		if blocked {
-			t.setSignalMaskLocked(t.signalMask &^ linux.SignalSetOf(sig))
+			t.setSignalMaskLocked(linux.SignalSet(t.signalMask.RacyLoad()) &^ linux.SignalSetOf(sig))
 		}
 	}
 }
 
 // SignalMask returns a copy of t's signal mask.
 func (t *Task) SignalMask() linux.SignalSet {
-	return linux.SignalSet(atomic.LoadUint64((*uint64)(&t.signalMask)))
+	return linux.SignalSet(t.signalMask.Load())
 }
 
 // SetSignalMask sets t's signal mask.
 //
 // Preconditions:
-// * The caller must be running on the task goroutine.
-// * t.exitState < TaskExitZombie.
+//   - The caller must be running on the task goroutine.
+//   - t.exitState < TaskExitZombie.
 func (t *Task) SetSignalMask(mask linux.SignalSet) {
 	// By precondition, t prevents t.tg from completing an execve and mutating
 	// t.tg.signalHandlers, so we can skip the TaskSet mutex.
@@ -603,8 +605,8 @@ func (t *Task) SetSignalMask(mask linux.SignalSet) {
 
 // Preconditions: The signal mutex must be locked.
 func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
-	oldMask := t.signalMask
-	atomic.StoreUint64((*uint64)(&t.signalMask), uint64(mask))
+	oldMask := linux.SignalSet(t.signalMask.RacyLoad())
+	t.signalMask.Store(uint64(mask))
 
 	// If the new mask blocks any signals that were not blocked by the old
 	// mask, and at least one such signal is pending in tg.pendingSignals, and
@@ -642,13 +644,42 @@ func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 }
 
 // SignalStack returns the task-private signal stack.
+//
+// By precondition, a full state has to be pulled.
 func (t *Task) SignalStack() linux.SignalStack {
-	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
 		alt.Flags |= linux.SS_ONSTACK
 	}
 	return alt
+}
+
+// SigaltStack implements the sigaltstack syscall.
+func (t *Task) SigaltStack(setaddr hostarch.Addr, oldaddr hostarch.Addr) (*SyscallControl, error) {
+	if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+		return CtrlDoExit, linuxerr.EFAULT
+	}
+
+	alt := t.SignalStack()
+	if oldaddr != 0 {
+		if _, err := alt.CopyOut(t, oldaddr); err != nil {
+			return nil, err
+		}
+	}
+	if setaddr != 0 {
+		if _, err := alt.CopyIn(t, setaddr); err != nil {
+			return nil, err
+		}
+		// The signal stack cannot be changed if the task is currently
+		// on the stack. This is enforced at the lowest level because
+		// these semantics apply to changing the signal stack via a
+		// ucontext during a signal handler.
+		if !t.SetSignalStack(alt) {
+			return nil, linuxerr.EPERM
+		}
+	}
+	return nil, nil
 }
 
 // onSignalStack returns true if the task is executing on the given signal stack.
@@ -1015,8 +1046,11 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 	}
 
 	// Are there signals pending?
-	if info := t.dequeueSignalLocked(t.signalMask); info != nil {
-		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+	if info := t.dequeueSignalLocked(linux.SignalSet(t.signalMask.RacyLoad())); info != nil {
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+			return (*runExit)(nil)
+		}
 
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the
@@ -1083,7 +1117,7 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 	t.tg.signalHandlers.mu.Lock()
 	t.tg.pidns.owner.mu.Unlock()
 	// If the signal is masked, re-queue it.
-	if linux.SignalSetOf(sig)&t.signalMask != 0 {
+	if linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0 {
 		t.sendSignalLocked(info, false /* group */)
 		t.tg.signalHandlers.mu.Unlock()
 		return (*runInterrupt)(nil)

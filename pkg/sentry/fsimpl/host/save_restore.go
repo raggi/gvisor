@@ -17,7 +17,6 @@ package host
 import (
 	"fmt"
 	"io"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -38,7 +37,7 @@ func (i *inode) beforeSave() {
 		// EBADF from the read.
 		i.bufMu.Lock()
 		defer i.bufMu.Unlock()
-		var buf [hostarch.PageSize]byte
+		var buf = make([]byte, hostarch.PageSize)
 		for {
 			n, err := hostfd.Preadv2(int32(i.hostFD), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:])), -1 /* offset */, 0 /* flags */)
 			if n != 0 {
@@ -52,7 +51,7 @@ func (i *inode) beforeSave() {
 			}
 		}
 		if len(i.buf) != 0 {
-			atomic.StoreUint32(&i.haveBuf, 1)
+			i.haveBuf.Store(1)
 		}
 	}
 }

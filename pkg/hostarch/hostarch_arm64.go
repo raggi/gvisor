@@ -24,22 +24,19 @@ import (
 )
 
 const (
-	// PageSize is the system page size.
-	// arm64 support 4K/16K/64K page size,
-	// which can be get by unix.Getpagesize().
-	// Currently, only 4K page size is supported.
-	PageSize = 1 << PageShift
-
 	// HugePageSize is the system huge page size.
 	HugePageSize = 1 << HugePageShift
 
-	// PageShift is the binary log of the system page size.
-	PageShift = 12
+	// CacheLineSize is the size of the cache line.
+	CacheLineSize = 1 << CacheLineShift
 
 	// HugePageShift is the binary log of the system huge page size.
 	// Should be calculated by "PageShift + (PageShift - 3)"
 	// when multiple page size support is ready.
 	HugePageShift = 21
+
+	// CacheLineShift is the binary log of the cache line size.
+	CacheLineShift = 6
 )
 
 var (

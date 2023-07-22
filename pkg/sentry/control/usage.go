@@ -127,9 +127,18 @@ func (u *Usage) Collect(opts *MemoryUsageOpts, out *MemoryUsage) error {
 
 // UsageReduceOpts contains options to Usage.Reduce().
 type UsageReduceOpts struct {
-	// If Wait is true, Reduce blocks until all activity initiated by
+	// If Wait is `true`, Reduce blocks until all activity initiated by
 	// Usage.Reduce() has completed.
+	// If Wait is `false`, Go garbage collection is still performed and may
+	// still block for some time, unless `DoNotGC` is `true`.
 	Wait bool `json:"wait"`
+
+	// If DoNotGC is true, Reduce does not explicitly run Go garbage collection.
+	// Garbage collection may block for an indeterminate amount of time.
+	// Note that the runtime Go may still perform routine garbage collection at
+	// any time during program execution, so a routine GC is still possible even
+	// when this option set to `true`.
+	DoNotGC bool `json:"do_not_gc"`
 }
 
 // UsageReduceOutput contains output from Usage.Reduce().
@@ -141,6 +150,9 @@ func (u *Usage) Reduce(opts *UsageReduceOpts, out *UsageReduceOutput) error {
 	mf.StartEvictions()
 	if opts.Wait {
 		mf.WaitForEvictions()
+	}
+	if !opts.DoNotGC {
+		runtime.GC()
 	}
 	return nil
 }
@@ -205,5 +217,6 @@ func (m *MemoryUsageRecord) Fetch() (mapped, unknown, total uint64, err error) {
 		return 0, 0, 0, err
 	}
 	fmem := uint64(stat.Blocks) * 512
-	return m.stats.RTMapped, fmem, m.stats.RTMapped + fmem, nil
+	rtmapped := m.stats.RTMapped.Load()
+	return rtmapped, fmem, rtmapped + fmem, nil
 }

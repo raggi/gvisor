@@ -62,10 +62,15 @@ const xSaveInfoNumLeaves = 64 // Maximum number of xSaveInfo leaves.
 
 // The "extended" functions.
 const (
-	extendedStart        cpuidFunction = 0x80000000
-	extendedFunctionInfo cpuidFunction = extendedStart + 0 // Returns highest available extended function in eax.
-	extendedFeatures                   = extendedStart + 1 // Returns some extended feature bits in edx and ecx.
-	addressSizes                       = extendedStart + 8 // Physical and virtual address sizes.
+	extendedStart         cpuidFunction = 0x80000000
+	extendedFunctionInfo  cpuidFunction = extendedStart + 0 // Returns highest available extended function in eax.
+	extendedFeatures                    = extendedStart + 1 // Returns some extended feature bits in edx and ecx.
+	processorBrandString2               = extendedStart + 2 // Processor Name String Identifier.
+	processorBrandString3               = extendedStart + 3 // Processor Name String Identifier.
+	processorBrandString4               = extendedStart + 4 // Processor Name String Identifier.
+	l1CacheAndTLBInfo                   = extendedStart + 5 // Returns L2 cache information.
+	l2CacheInfo                         = extendedStart + 6 // Returns L2 cache information.
+	addressSizes                        = extendedStart + 8 // Physical and virtual address sizes.
 )
 
 var allowedBasicFunctions = [...]bool{
@@ -78,9 +83,14 @@ var allowedBasicFunctions = [...]bool{
 }
 
 var allowedExtendedFunctions = [...]bool{
-	extendedFunctionInfo - extendedStart: true,
-	extendedFeatures - extendedStart:     true,
-	addressSizes - extendedStart:         true,
+	extendedFunctionInfo - extendedStart:  true,
+	extendedFeatures - extendedStart:      true,
+	addressSizes - extendedStart:          true,
+	processorBrandString2 - extendedStart: true,
+	processorBrandString3 - extendedStart: true,
+	processorBrandString4 - extendedStart: true,
+	l1CacheAndTLBInfo - extendedStart:     true,
+	l2CacheInfo - extendedStart:           true,
 }
 
 // Function executes a CPUID function.
@@ -107,6 +117,8 @@ type In struct {
 func (i *In) normalize() {
 	switch cpuidFunction(i.Eax) {
 	case vendorID, featureInfo, intelCacheDescriptors, extendedFunctionInfo, extendedFeatures:
+		i.Ecx = 0 // Ignore.
+	case processorBrandString2, processorBrandString3, processorBrandString4, l1CacheAndTLBInfo, l2CacheInfo:
 		i.Ecx = 0 // Ignore.
 	case intelDeterministicCacheParams, extendedFeatureInfo:
 		// Preserve i.Ecx.
@@ -150,13 +162,13 @@ func (fs FeatureSet) query(fn cpuidFunction) (uint32, uint32, uint32, uint32) {
 	return out.Eax, out.Ebx, out.Ecx, out.Edx
 }
 
+var hostFeatureSet FeatureSet
+
 // HostFeatureSet returns a host CPUID.
 //
 //go:nosplit
 func HostFeatureSet() FeatureSet {
-	return FeatureSet{
-		Function: &Native{},
-	}
+	return hostFeatureSet
 }
 
 var (
@@ -167,7 +179,7 @@ var (
 // Reads max cpu frequency from host /proc/cpuinfo. Must run before syscall
 // filter installation. This value is used to create the fake /proc/cpuinfo
 // from a FeatureSet.
-func init() {
+func readMaxCPUFreq() {
 	cpuinfob, err := ioutil.ReadFile("/proc/cpuinfo")
 	if err != nil {
 		// Leave it as 0... the VDSO bails out in the same way.
@@ -200,4 +212,15 @@ func init() {
 		}
 	}
 	log.Warningf("Could not parse /proc/cpuinfo, it is empty or does not contain cpu MHz")
+
+}
+
+// archInitialize initializes hostFeatureSet.
+func archInitialize() {
+	hostFeatureSet = FeatureSet{
+		Function: &Native{},
+	}.Fixed()
+
+	readMaxCPUFreq()
+	initHWCap()
 }

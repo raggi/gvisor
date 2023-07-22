@@ -28,10 +28,16 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
+// Caller provides the droppedIDs slice to collect dropped mapping
+// identities. The caller must drop the references on these identities outside a
+// mm.mappingMu critical section. droppedIDs has append-like semantics, multiple
+// calls to functions that drop mapping identities within a scope should reuse
+// the same slice.
+//
 // Preconditions:
-// * mm.mappingMu must be locked for writing.
-// * opts must be valid as defined by the checks in MMap.
-func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts) (vmaIterator, hostarch.AddrRange, error) {
+//   - mm.mappingMu must be locked for writing.
+//   - opts must be valid as defined by the checks in MMap.
+func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts, droppedIDs []memmap.MappingIdentity) (vmaIterator, hostarch.AddrRange, []memmap.MappingIdentity, error) {
 	if opts.MaxPerms != opts.MaxPerms.Effective() {
 		panic(fmt.Sprintf("Non-effective MaxPerms %s cannot be enforced", opts.MaxPerms))
 	}
@@ -48,7 +54,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		if opts.Force && opts.Unmap && opts.Fixed {
 			addr = opts.Addr
 		} else {
-			return vmaIterator{}, hostarch.AddrRange{}, err
+			return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, err
 		}
 	}
 	ar, _ := addr.ToRange(opts.Length)
@@ -59,7 +65,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		newUsageAS -= uint64(mm.vmas.SpanRange(ar))
 	}
 	if limitAS := limits.FromContext(ctx).Get(limits.AS).Cur; newUsageAS > limitAS {
-		return vmaIterator{}, hostarch.AddrRange{}, linuxerr.ENOMEM
+		return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.ENOMEM
 	}
 
 	if opts.MLockMode != memmap.MLockNone {
@@ -67,14 +73,14 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		if creds := auth.CredentialsFromContext(ctx); !creds.HasCapabilityIn(linux.CAP_IPC_LOCK, creds.UserNamespace.Root()) {
 			mlockLimit := limits.FromContext(ctx).Get(limits.MemoryLocked).Cur
 			if mlockLimit == 0 {
-				return vmaIterator{}, hostarch.AddrRange{}, linuxerr.EPERM
+				return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.EPERM
 			}
 			newLockedAS := mm.lockedAS + opts.Length
 			if opts.Unmap {
 				newLockedAS -= mm.mlockedBytesRangeLocked(ar)
 			}
 			if newLockedAS > mlockLimit {
-				return vmaIterator{}, hostarch.AddrRange{}, linuxerr.EAGAIN
+				return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.EAGAIN
 			}
 		}
 	}
@@ -84,7 +90,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 	// file->f_op->mmap().
 	var vgap vmaGapIterator
 	if opts.Unmap {
-		vgap = mm.unmapLocked(ctx, ar)
+		vgap, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
 	} else {
 		vgap = mm.vmas.FindGap(ar.Start)
 	}
@@ -94,7 +100,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		// The expression for writable is vma.canWriteMappableLocked(), but we
 		// don't yet have a vma.
 		if err := opts.Mappable.AddMapping(ctx, mm, ar, opts.Offset, !opts.Private && opts.MaxPerms.Write); err != nil {
-			return vmaIterator{}, hostarch.AddrRange{}, err
+			return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, err
 		}
 	}
 
@@ -128,15 +134,15 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		mm.lockedAS += opts.Length
 	}
 
-	return vseg, ar, nil
+	return vseg, ar, droppedIDs, nil
 }
 
 type findAvailableOpts struct {
 	// These fields are equivalent to those in memmap.MMapOpts, except that:
 	//
-	// - Addr must be page-aligned.
+	//	- Addr must be page-aligned.
 	//
-	// - Unmap allows existing guard pages in the returned range.
+	//	- Unmap allows existing guard pages in the returned range.
 
 	Addr     hostarch.Addr
 	Fixed    bool
@@ -253,18 +259,18 @@ func (mm *MemoryManager) mlockedBytesRangeLocked(ar hostarch.AddrRange) uint64 {
 // getVMAsLocked ensures that vmas exist for all addresses in ar, and support
 // access of type (at, ignorePermissions). It returns:
 //
-// - An iterator to the vma containing ar.Start. If no vma contains ar.Start,
-// the iterator is unspecified.
+//   - An iterator to the vma containing ar.Start. If no vma contains ar.Start,
+//     the iterator is unspecified.
 //
-// - An iterator to the gap after the last vma containing an address in ar. If
-// vmas exist for no addresses in ar, the iterator is to a gap that begins
-// before ar.Start.
+//   - An iterator to the gap after the last vma containing an address in ar. If
+//     vmas exist for no addresses in ar, the iterator is to a gap that begins
+//     before ar.Start.
 //
-// - An error that is non-nil if vmas exist for only a subset of ar.
+//   - An error that is non-nil if vmas exist for only a subset of ar.
 //
 // Preconditions:
-// * mm.mappingMu must be locked for reading; it may be temporarily unlocked.
-// * ar.Length() != 0.
+//   - mm.mappingMu must be locked for reading; it may be temporarily unlocked.
+//   - ar.Length() != 0.
 func (mm *MemoryManager) getVMAsLocked(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool) (vmaIterator, vmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
@@ -340,16 +346,22 @@ func (mm *MemoryManager) getVecVMAsLocked(ctx context.Context, ars hostarch.Addr
 //
 // guardBytes is equivalent to Linux's stack_guard_gap after upstream
 // 1be7107fbe18 "mm: larger stack guard gap, between vmas".
-const guardBytes = 256 * hostarch.PageSize
+var guardBytes = hostarch.Addr(256 * hostarch.PageSize)
 
 // unmapLocked unmaps all addresses in ar and returns the resulting gap in
 // mm.vmas.
 //
+// Caller provides the droppedIDs slice to collect dropped mapping
+// identities. The caller must drop the references on these identities outside a
+// mm.mappingMu critical section. droppedIDs has append-like semantics, multiple
+// calls to functions that drop mapping identities within a scope should reuse
+// the same slice.
+//
 // Preconditions:
-// * mm.mappingMu must be locked for writing.
-// * ar.Length() != 0.
-// * ar must be page-aligned.
-func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange) vmaGapIterator {
+//   - mm.mappingMu must be locked for writing.
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
+func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
@@ -359,24 +371,28 @@ func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange)
 	// AddressSpace mappings and pmas must be invalidated before
 	// mm.removeVMAsLocked() => memmap.Mappable.RemoveMapping().
 	mm.Invalidate(ar, memmap.InvalidateOpts{InvalidatePrivate: true})
-	return mm.removeVMAsLocked(ctx, ar)
+	return mm.removeVMAsLocked(ctx, ar, droppedIDs)
 }
 
-// removeVMAsLocked removes vmas for addresses in ar and returns the resulting
-// gap in mm.vmas. It does not remove pmas or AddressSpace mappings; clients
-// must do so before calling removeVMAsLocked.
+// removeVMAsLocked removes vmas for addresses in ar and returns the
+// resulting gap in mm.vmas.
+//
+// Caller provides the droppedIDs slice to collect dropped mapping
+// identities. The caller must drop the references on these identities outside a
+// mm.mappingMu critical section. droppedIDs has append-like semantics, multiple
+// calls to functions that drop mapping identities within a scope should reuse
+// the same slice.
 //
 // Preconditions:
-// * mm.mappingMu must be locked for writing.
-// * ar.Length() != 0.
-// * ar must be page-aligned.
-func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrRange) vmaGapIterator {
+//   - mm.mappingMu must be locked for writing.
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
+func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
-
 	vseg, vgap := mm.vmas.Find(ar.Start)
 	if vgap.Ok() {
 		vseg = vgap.NextSegment()
@@ -389,7 +405,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 			vma.mappable.RemoveMapping(ctx, mm, vmaAR, vma.off, vma.canWriteMappableLocked())
 		}
 		if vma.id != nil {
-			vma.id.DecRef(ctx)
+			droppedIDs = append(droppedIDs, vma.id)
 		}
 		mm.usageAS -= uint64(vmaAR.Length())
 		if vma.isPrivateDataLocked() {
@@ -401,7 +417,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 		vgap = mm.vmas.Remove(vseg)
 		vseg = vgap.NextSegment()
 	}
-	return vgap
+	return vgap, droppedIDs
 }
 
 // canWriteMappableLocked returns true if it is possible for vma.mappable to be
@@ -459,6 +475,9 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 	}
 
 	if vma2.id != nil {
+		// This DecRef() will never be the final ref, since the vma1 is
+		// currently holding a ref to the same mapping identity. Thus, we don't
+		// need to worry about whether we're in a mm.mappingMu critical section.
 		vma2.id.DecRef(context.Background())
 	}
 	return vma1, true
@@ -476,8 +495,8 @@ func (vmaSetFunctions) Split(ar hostarch.AddrRange, v vma, split hostarch.Addr) 
 }
 
 // Preconditions:
-// * vseg.ValuePtr().mappable != nil.
-// * vseg.Range().Contains(addr).
+//   - vseg.ValuePtr().mappable != nil.
+//   - vseg.Range().Contains(addr).
 func (vseg vmaIterator) mappableOffsetAt(addr hostarch.Addr) uint64 {
 	if checkInvariants {
 		if !vseg.Ok() {
@@ -502,9 +521,9 @@ func (vseg vmaIterator) mappableRange() memmap.MappableRange {
 }
 
 // Preconditions:
-// * vseg.ValuePtr().mappable != nil.
-// * vseg.Range().IsSupersetOf(ar).
-// * ar.Length() != 0.
+//   - vseg.ValuePtr().mappable != nil.
+//   - vseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
 func (vseg vmaIterator) mappableRangeOf(ar hostarch.AddrRange) memmap.MappableRange {
 	if checkInvariants {
 		if !vseg.Ok() {
@@ -527,9 +546,9 @@ func (vseg vmaIterator) mappableRangeOf(ar hostarch.AddrRange) memmap.MappableRa
 }
 
 // Preconditions:
-// * vseg.ValuePtr().mappable != nil.
-// * vseg.mappableRange().IsSupersetOf(mr).
-// * mr.Length() != 0.
+//   - vseg.ValuePtr().mappable != nil.
+//   - vseg.mappableRange().IsSupersetOf(mr).
+//   - mr.Length() != 0.
 func (vseg vmaIterator) addrRangeOf(mr memmap.MappableRange) hostarch.AddrRange {
 	if checkInvariants {
 		if !vseg.Ok() {
@@ -555,8 +574,8 @@ func (vseg vmaIterator) addrRangeOf(mr memmap.MappableRange) hostarch.AddrRange 
 // scanning linearly forward from vseg.
 //
 // Preconditions:
-// * mm.mappingMu must be locked.
-// * addr >= vseg.Start().
+//   - mm.mappingMu must be locked.
+//   - addr >= vseg.Start().
 func (vseg vmaIterator) seekNextLowerBound(addr hostarch.Addr) vmaIterator {
 	if checkInvariants {
 		if !vseg.Ok() {

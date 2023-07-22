@@ -79,7 +79,7 @@ func (k *Kernel) NewKcov() *Kcov {
 }
 
 var coveragePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 0)
 	},
 }
@@ -130,7 +130,7 @@ func (kcov *Kcov) InitTrace(size uint64) error {
 
 	// To simplify all the logic around mapping, we require that the length of the
 	// shared region is a multiple of the system page size.
-	if (8*size)&(hostarch.PageSize-1) != 0 {
+	if (8*size)&uint64(hostarch.PageSize-1) != 0 {
 		return linuxerr.EINVAL
 	}
 
@@ -242,7 +242,11 @@ func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 
 	if kcov.mappable == nil {
 		// Set up the kcov area.
-		fr, err := kcov.mfp.MemoryFile().Allocate(kcov.size*8, pgalloc.AllocOpts{Kind: usage.Anonymous})
+		opts := pgalloc.AllocOpts{
+			Kind:    usage.Anonymous,
+			MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		}
+		fr, err := kcov.mfp.MemoryFile().Allocate(kcov.size*8, opts)
 		if err != nil {
 			return err
 		}

@@ -16,10 +16,10 @@ package transport
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -78,7 +78,7 @@ type HostConnectedEndpoint struct {
 	// GetSockOpt and message splitting/rejection in SendMsg, but do not
 	// prevent lots of small messages from filling the real send buffer
 	// size on the host.
-	sndbuf int64 `state:"nosave"`
+	sndbuf atomicbitops.Int64 `state:"nosave"`
 
 	// stype is the type of Unix socket.
 	stype linux.SockType
@@ -117,7 +117,7 @@ func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
 	}
 
 	c.stype = linux.SockType(stype)
-	atomic.StoreInt64(&c.sndbuf, int64(sndbuf))
+	c.sndbuf.Store(int64(sndbuf))
 
 	return nil
 }
@@ -149,7 +149,7 @@ func (c *HostConnectedEndpoint) SockType() linux.SockType {
 }
 
 // Send implements ConnectedEndpoint.Send.
-func (c *HostConnectedEndpoint) Send(ctx context.Context, data [][]byte, controlMessages ControlMessages, from tcpip.FullAddress) (int64, bool, *syserr.Error) {
+func (c *HostConnectedEndpoint) Send(ctx context.Context, data [][]byte, controlMessages ControlMessages, from Address) (int64, bool, *syserr.Error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -212,8 +212,8 @@ func (c *HostConnectedEndpoint) Passcred() bool {
 }
 
 // GetLocalAddress implements ConnectedEndpoint.GetLocalAddress.
-func (c *HostConnectedEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
-	return tcpip.FullAddress{Addr: tcpip.Address(c.addr)}, nil
+func (c *HostConnectedEndpoint) GetLocalAddress() (Address, tcpip.Error) {
+	return Address{Addr: c.addr}, nil
 }
 
 // EventUpdate implements ConnectedEndpoint.EventUpdate.
@@ -229,7 +229,7 @@ func (c *HostConnectedEndpoint) EventUpdate() error {
 }
 
 // Recv implements Receiver.Recv.
-func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool) (int64, int64, ControlMessages, bool, tcpip.FullAddress, bool, *syserr.Error) {
+func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool) (int64, int64, ControlMessages, bool, Address, bool, *syserr.Error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -248,7 +248,7 @@ func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds b
 		err = nil
 	}
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, tcpip.FullAddress{}, false, syserr.FromError(err)
+		return 0, 0, ControlMessages{}, false, Address{}, false, syserr.FromError(err)
 	}
 
 	// There is no need for the callee to call RecvNotify because fdReadVec uses
@@ -261,18 +261,18 @@ func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds b
 
 	// Avoid extra allocations in the case where there isn't any control data.
 	if len(cm) == 0 {
-		return rl, ml, ControlMessages{}, cTrunc, tcpip.FullAddress{Addr: tcpip.Address(c.addr)}, false, nil
+		return rl, ml, ControlMessages{}, cTrunc, Address{Addr: c.addr}, false, nil
 	}
 
 	fds, err := cm.ExtractFDs()
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, tcpip.FullAddress{}, false, syserr.FromError(err)
+		return 0, 0, ControlMessages{}, false, Address{}, false, syserr.FromError(err)
 	}
 
 	if len(fds) == 0 {
-		return rl, ml, ControlMessages{}, cTrunc, tcpip.FullAddress{Addr: tcpip.Address(c.addr)}, false, nil
+		return rl, ml, ControlMessages{}, cTrunc, Address{Addr: c.addr}, false, nil
 	}
-	return rl, ml, ControlMessages{Rights: &SCMRights{fds}}, cTrunc, tcpip.FullAddress{Addr: tcpip.Address(c.addr)}, false, nil
+	return rl, ml, ControlMessages{Rights: &SCMRights{fds}}, cTrunc, Address{Addr: c.addr}, false, nil
 }
 
 // RecvNotify implements Receiver.RecvNotify.
@@ -314,14 +314,14 @@ func (c *HostConnectedEndpoint) RecvQueuedSize() int64 {
 
 // SendMaxQueueSize implements Receiver.SendMaxQueueSize.
 func (c *HostConnectedEndpoint) SendMaxQueueSize() int64 {
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // RecvMaxQueueSize implements Receiver.RecvMaxQueueSize.
 func (c *HostConnectedEndpoint) RecvMaxQueueSize() int64 {
 	// N.B. Unix sockets don't use the receive buffer. We'll claim it is
 	// the same size as the send buffer.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 func (c *HostConnectedEndpoint) destroyLocked() {
@@ -344,7 +344,7 @@ func (c *HostConnectedEndpoint) CloseUnread() {}
 func (c *HostConnectedEndpoint) SetSendBufferSize(v int64) (newSz int64) {
 	// gVisor does not permit setting of SO_SNDBUF for host backed unix
 	// domain sockets.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // SetReceiveBufferSize implements ConnectedEndpoint.SetReceiveBufferSize.
@@ -352,15 +352,15 @@ func (c *HostConnectedEndpoint) SetReceiveBufferSize(v int64) (newSz int64) {
 	// gVisor does not permit setting of SO_RCVBUF for host backed unix
 	// domain sockets. Receive buffer does not have any effect for unix
 	// sockets and we claim to be the same as send buffer.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // SCMConnectedEndpoint represents an endpoint backed by a host fd that was
 // passed through a gofer Unix socket. It resembles HostConnectedEndpoint, with the
 // following differences:
-// - SCMConnectedEndpoint is not saveable, because the host cannot guarantee
-// the same descriptor number across S/R.
-// - SCMConnectedEndpoint holds ownership of its fd and notification queue.
+//   - SCMConnectedEndpoint is not saveable, because the host cannot guarantee
+//     the same descriptor number across S/R.
+//   - SCMConnectedEndpoint holds ownership of its fd and notification queue.
 type SCMConnectedEndpoint struct {
 	HostConnectedEndpoint
 

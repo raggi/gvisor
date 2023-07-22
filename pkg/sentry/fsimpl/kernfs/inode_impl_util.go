@@ -16,9 +16,9 @@ package kernfs
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -176,17 +176,17 @@ func (InodeNotSymlink) Getlink(context.Context, *vfs.Mount) (vfs.VirtualDentry, 
 type InodeAttrs struct {
 	devMajor  uint32
 	devMinor  uint32
-	ino       uint64
-	mode      uint32
-	uid       uint32
-	gid       uint32
-	nlink     uint32
-	blockSize uint32
+	ino       atomicbitops.Uint64
+	mode      atomicbitops.Uint32
+	uid       atomicbitops.Uint32
+	gid       atomicbitops.Uint32
+	nlink     atomicbitops.Uint32
+	blockSize atomicbitops.Uint32
 
 	// Timestamps, all nsecs from the Unix epoch.
-	atime int64
-	mtime int64
-	ctime int64
+	atime atomicbitops.Int64
+	mtime atomicbitops.Int64
+	ctime atomicbitops.Int64
 }
 
 // Init initializes this InodeAttrs.
@@ -201,16 +201,16 @@ func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor
 	}
 	a.devMajor = devMajor
 	a.devMinor = devMinor
-	atomic.StoreUint64(&a.ino, ino)
-	atomic.StoreUint32(&a.mode, uint32(mode))
-	atomic.StoreUint32(&a.uid, uint32(creds.EffectiveKUID))
-	atomic.StoreUint32(&a.gid, uint32(creds.EffectiveKGID))
-	atomic.StoreUint32(&a.nlink, nlink)
-	atomic.StoreUint32(&a.blockSize, hostarch.PageSize)
+	a.ino.Store(ino)
+	a.mode.Store(uint32(mode))
+	a.uid.Store(uint32(creds.EffectiveKUID))
+	a.gid.Store(uint32(creds.EffectiveKGID))
+	a.nlink.Store(nlink)
+	a.blockSize.Store(uint32(hostarch.PageSize))
 	now := ktime.NowFromContext(ctx).Nanoseconds()
-	atomic.StoreInt64(&a.atime, now)
-	atomic.StoreInt64(&a.mtime, now)
-	atomic.StoreInt64(&a.ctime, now)
+	a.atime.Store(now)
+	a.mtime.Store(now)
+	a.ctime.Store(now)
 }
 
 // DevMajor returns the device major number.
@@ -225,17 +225,27 @@ func (a *InodeAttrs) DevMinor() uint32 {
 
 // Ino returns the inode id.
 func (a *InodeAttrs) Ino() uint64 {
-	return atomic.LoadUint64(&a.ino)
+	return a.ino.Load()
+}
+
+// UID implements Inode.UID.
+func (a *InodeAttrs) UID() auth.KUID {
+	return auth.KUID(a.uid.Load())
+}
+
+// GID implements Inode.GID.
+func (a *InodeAttrs) GID() auth.KGID {
+	return auth.KGID(a.gid.Load())
 }
 
 // Mode implements Inode.Mode.
 func (a *InodeAttrs) Mode() linux.FileMode {
-	return linux.FileMode(atomic.LoadUint32(&a.mode))
+	return linux.FileMode(a.mode.Load())
 }
 
 // Links returns the link count.
 func (a *InodeAttrs) Links() uint32 {
-	return atomic.LoadUint32(&a.nlink)
+	return a.nlink.Load()
 }
 
 // TouchAtime updates a.atime to the current time.
@@ -246,7 +256,7 @@ func (a *InodeAttrs) TouchAtime(ctx context.Context, mnt *vfs.Mount) {
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return
 	}
-	atomic.StoreInt64(&a.atime, ktime.NowFromContext(ctx).Nanoseconds())
+	a.atime.Store(ktime.NowFromContext(ctx).Nanoseconds())
 	mnt.EndWrite()
 }
 
@@ -255,8 +265,8 @@ func (a *InodeAttrs) TouchAtime(ctx context.Context, mnt *vfs.Mount) {
 // value.
 func (a *InodeAttrs) TouchCMtime(ctx context.Context) {
 	now := ktime.NowFromContext(ctx).Nanoseconds()
-	atomic.StoreInt64(&a.mtime, now)
-	atomic.StoreInt64(&a.ctime, now)
+	a.mtime.Store(now)
+	a.ctime.Store(now)
 }
 
 // Stat partially implements Inode.Stat. Note that this function doesn't provide
@@ -267,15 +277,15 @@ func (a *InodeAttrs) Stat(context.Context, *vfs.Filesystem, vfs.StatOptions) (li
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_NLINK | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME
 	stat.DevMajor = a.devMajor
 	stat.DevMinor = a.devMinor
-	stat.Ino = atomic.LoadUint64(&a.ino)
+	stat.Ino = a.ino.Load()
 	stat.Mode = uint16(a.Mode())
-	stat.UID = atomic.LoadUint32(&a.uid)
-	stat.GID = atomic.LoadUint32(&a.gid)
-	stat.Nlink = atomic.LoadUint32(&a.nlink)
-	stat.Blksize = atomic.LoadUint32(&a.blockSize)
-	stat.Atime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&a.atime))
-	stat.Mtime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&a.mtime))
-	stat.Ctime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&a.ctime))
+	stat.UID = a.uid.Load()
+	stat.GID = a.gid.Load()
+	stat.Nlink = a.nlink.Load()
+	stat.Blksize = a.blockSize.Load()
+	stat.Atime = linux.NsecToStatxTimestamp(a.atime.Load())
+	stat.Mtime = linux.NsecToStatxTimestamp(a.mtime.Load())
+	stat.Ctime = linux.NsecToStatxTimestamp(a.ctime.Load())
 	return stat, nil
 }
 
@@ -295,29 +305,29 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	if opts.Stat.Mask&linux.STATX_SIZE != 0 && a.Mode().IsDir() {
 		return linuxerr.EISDIR
 	}
-	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), auth.KUID(atomic.LoadUint32(&a.uid)), auth.KGID(atomic.LoadUint32(&a.gid))); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), auth.KUID(a.uid.Load()), auth.KGID(a.gid.Load())); err != nil {
 		return err
 	}
 
 	clearSID := false
 	stat := opts.Stat
 	if stat.Mask&linux.STATX_UID != 0 {
-		atomic.StoreUint32(&a.uid, stat.UID)
+		a.uid.Store(stat.UID)
 		clearSID = true
 	}
 	if stat.Mask&linux.STATX_GID != 0 {
-		atomic.StoreUint32(&a.gid, stat.GID)
+		a.gid.Store(stat.GID)
 		clearSID = true
 	}
 	if stat.Mask&linux.STATX_MODE != 0 {
 		for {
-			old := atomic.LoadUint32(&a.mode)
+			old := a.mode.Load()
 			ft := old & linux.S_IFMT
 			newMode := ft | uint32(stat.Mode & ^uint16(linux.S_IFMT))
 			if clearSID {
 				newMode = vfs.ClearSUIDAndSGID(newMode)
 			}
-			if swapped := atomic.CompareAndSwapUint32(&a.mode, old, newMode); swapped {
+			if swapped := a.mode.CompareAndSwap(old, newMode); swapped {
 				clearSID = false
 				break
 			}
@@ -328,9 +338,9 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	// STATX_MODE.
 	if clearSID {
 		for {
-			old := atomic.LoadUint32(&a.mode)
+			old := a.mode.Load()
 			newMode := vfs.ClearSUIDAndSGID(old)
-			if swapped := atomic.CompareAndSwapUint32(&a.mode, old, newMode); swapped {
+			if swapped := a.mode.CompareAndSwap(old, newMode); swapped {
 				break
 			}
 		}
@@ -341,13 +351,13 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 		if stat.Atime.Nsec == linux.UTIME_NOW {
 			stat.Atime = linux.NsecToStatxTimestamp(now)
 		}
-		atomic.StoreInt64(&a.atime, stat.Atime.ToNsec())
+		a.atime.Store(stat.Atime.ToNsec())
 	}
 	if stat.Mask&linux.STATX_MTIME != 0 {
 		if stat.Mtime.Nsec == linux.UTIME_NOW {
 			stat.Mtime = linux.NsecToStatxTimestamp(now)
 		}
-		atomic.StoreInt64(&a.mtime, stat.Mtime.ToNsec())
+		a.mtime.Store(stat.Mtime.ToNsec())
 	}
 
 	return nil
@@ -359,21 +369,21 @@ func (a *InodeAttrs) CheckPermissions(_ context.Context, creds *auth.Credentials
 		creds,
 		ats,
 		a.Mode(),
-		auth.KUID(atomic.LoadUint32(&a.uid)),
-		auth.KGID(atomic.LoadUint32(&a.gid)),
+		auth.KUID(a.uid.Load()),
+		auth.KGID(a.gid.Load()),
 	)
 }
 
 // IncLinks implements Inode.IncLinks.
 func (a *InodeAttrs) IncLinks(n uint32) {
-	if atomic.AddUint32(&a.nlink, n) <= n {
+	if a.nlink.Add(n) <= n {
 		panic("InodeLink.IncLinks called with no existing links")
 	}
 }
 
 // DecLinks implements Inode.DecLinks.
 func (a *InodeAttrs) DecLinks() {
-	if nlink := atomic.AddUint32(&a.nlink, ^uint32(0)); nlink == ^uint32(0) {
+	if nlink := a.nlink.Add(^uint32(0)); nlink == ^uint32(0) {
 		// Negative overflow
 		panic("Inode.DecLinks called at 0 links")
 	}
@@ -398,6 +408,16 @@ type OrderedChildrenOptions struct {
 	//
 	// Note that writable users must implement the sticky bit (I_SVTX).
 	Writable bool
+}
+
+// inodeWithOrderedChildren allows extraction of an OrderedChildren from an
+// Inode implementation. A concrete type that both implements the Inode
+// interface and embeds OrderedChildren will be castable to this interface, and
+// we can get to the embedded OrderedChildren through the orderedChildren
+// method.
+type inodeWithOrderedChildren interface {
+	Inode
+	orderedChildren() *OrderedChildren
 }
 
 // OrderedChildren partially implements the Inode interface. OrderedChildren can
@@ -427,6 +447,11 @@ type OrderedChildren struct {
 	set   map[string]*slot
 }
 
+// orderedChildren implements inodeWithOrderedChildren.orderedChildren.
+func (o *OrderedChildren) orderedChildren() *OrderedChildren {
+	return o
+}
+
 // Init initializes an OrderedChildren.
 func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 	o.writable = opts.Writable
@@ -454,9 +479,9 @@ func (o *OrderedChildren) Destroy(ctx context.Context) {
 // may use to update the link count for the parent directory.
 //
 // Precondition:
-//   * d must represent a directory inode.
-//   * children must not contain any conflicting entries already in o.
-//   * Caller must hold a reference on all inodes passed.
+//   - d must represent a directory inode.
+//   - children must not contain any conflicting entries already in o.
+//   - Caller must hold a reference on all inodes passed.
 //
 // Postcondition: Caller's references on inodes are transferred to o.
 func (o *OrderedChildren) Populate(children map[string]Inode) uint32 {
@@ -484,6 +509,16 @@ func (o *OrderedChildren) Lookup(ctx context.Context, name string) (Inode, error
 
 	s.inode.IncRef() // This ref is passed to the dentry upon creation via Init.
 	return s.inode, nil
+}
+
+// ForEachChild calls fn on all childrens tracked by this ordered children.
+func (o *OrderedChildren) ForEachChild(fn func(string, Inode)) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	for name, slot := range o.set {
+		fn(name, slot.inode)
+	}
 }
 
 // IterDirents implements Inode.IterDirents.
@@ -562,27 +597,6 @@ func (o *OrderedChildren) removeLocked(name string) {
 	}
 }
 
-// Precondition: caller must hold o.mu for writing.
-func (o *OrderedChildren) replaceChildLocked(ctx context.Context, name string, newI Inode) {
-	if s, ok := o.set[name]; ok {
-		if s.static {
-			panic(fmt.Sprintf("replacing a static inode: %v", s.inode))
-		}
-
-		// Existing slot with given name, simply replace the dentry.
-		s.inode = newI
-	}
-
-	// No existing slot with given name, create and hash new slot.
-	s := &slot{
-		name:   name,
-		inode:  newI,
-		static: false,
-	}
-	o.order.PushBack(s)
-	o.set[name] = s
-}
-
 // Precondition: caller must hold o.mu for reading or writing.
 func (o *OrderedChildren) checkExistingLocked(name string, child Inode) error {
 	s, ok := o.set[name]
@@ -590,7 +604,7 @@ func (o *OrderedChildren) checkExistingLocked(name string, child Inode) error {
 		return linuxerr.ENOENT
 	}
 	if s.inode != child {
-		panic(fmt.Sprintf("Inode doesn't match what kernfs thinks! OrderedChild: %+v, kernfs: %+v", s.inode, child))
+		panic(fmt.Sprintf("Inode doesn't match what kernfs thinks! Name: %q, OrderedChild: %p, kernfs: %p", name, s.inode, child))
 	}
 	return nil
 }
@@ -630,11 +644,11 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 	if !o.writable {
 		return linuxerr.EPERM
 	}
-
-	dst, ok := dstDir.(interface{}).(*OrderedChildren)
+	dstIOC, ok := dstDir.(inodeWithOrderedChildren)
 	if !ok {
 		return linuxerr.EXDEV
 	}
+	dst := dstIOC.orderedChildren()
 	if !dst.writable {
 		return linuxerr.EPERM
 	}
@@ -649,12 +663,28 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 		dst.mu.Lock()
 		defer dst.mu.Unlock()
 	}
+
+	// Ensure target inode exists in src.
 	if err := o.checkExistingLocked(oldname, child); err != nil {
 		return err
 	}
+
+	// Ensure no name collision in dst.
+	if _, ok := dst.set[newname]; ok {
+		return linuxerr.EEXIST
+	}
+
+	// Remove from src.
 	o.removeLocked(oldname)
 
-	dst.replaceChildLocked(ctx, newname, child)
+	// Add to dst.
+	s := &slot{
+		name:  newname,
+		inode: child,
+	}
+	dst.order.PushBack(s)
+	dst.set[newname] = s
+
 	return nil
 }
 
@@ -694,8 +724,10 @@ type StaticDirectory struct {
 	InodeAttrs
 	InodeDirectoryNoNewChildren
 	InodeNoStatFS
+	InodeNotAnonymous
 	InodeNotSymlink
 	InodeTemporary
+	InodeWatches
 	OrderedChildren
 	StaticDirectoryRefs
 
@@ -775,4 +807,36 @@ type InodeNoStatFS struct{}
 // StatFS implements Inode.StatFS.
 func (*InodeNoStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
 	return linux.Statfs{}, linuxerr.ENOSYS
+}
+
+// InodeWatches partially implements Inode.
+//
+// +stateify savable
+type InodeWatches struct {
+	watches vfs.Watches
+}
+
+// Watches implements Inode.Watches.
+func (i *InodeWatches) Watches() *vfs.Watches {
+	return &i.watches
+}
+
+// InodeAnonymous partially implements Inode.
+//
+// +stateify savable
+type InodeAnonymous struct{}
+
+// Anonymous implements Inode.Anonymous
+func (*InodeAnonymous) Anonymous() bool {
+	return true
+}
+
+// InodeNotAnonymous partially implements Inode.
+//
+// +stateify savable
+type InodeNotAnonymous struct{}
+
+// Anonymous implements Inode.Anonymous
+func (*InodeNotAnonymous) Anonymous() bool {
+	return false
 }
