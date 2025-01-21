@@ -262,7 +262,7 @@ func (l *TCPListener) Accept() (net.Conn, error) {
 
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr)
 		l.wq.EventRegister(&waitEntry)
 		defer l.wq.EventUnregister(&waitEntry)
 
@@ -312,7 +312,7 @@ func commonRead(b []byte, ep tcpip.Endpoint, wq *waiter.Queue, deadline <-chan s
 
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventRdHUp | waiter.EventHUp | waiter.EventErr)
 		wq.EventRegister(&waitEntry)
 		defer wq.EventUnregister(&waitEntry)
 		for {
@@ -673,7 +673,7 @@ func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := c.ep.Write(&r, writeOptions)
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 		c.wq.EventRegister(&waitEntry)
 		defer c.wq.EventUnregister(&waitEntry)
 		for {
